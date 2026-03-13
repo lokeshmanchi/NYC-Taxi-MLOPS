@@ -68,6 +68,8 @@ The whole pipeline is logged to MLflow via `mlflow.sklearn.log_model` (artifact 
 - Accepts `BASE_FEATURE_COLS` as input (no `is_weekend` — the pipeline generates it)
 - Calls `pipeline.predict(pd.DataFrame([features.dict()]))` — pipeline handles all transforms
 
+**Limitation:** The current API can only serve the scikit-learn/XGBoost pipeline artifact. It cannot load the PyTorch model.
+
 **Important:** `MODEL_PATH` defaults to `models/model.pkl`. After retraining, you must either download the artifact from MLflow and place it at that path, or update `MODEL_PATH` to an MLflow model URI (`runs:/<run_id>/model`).
 
 ### EDA Dashboard — `src/ui/pages/1_EDA.py`
