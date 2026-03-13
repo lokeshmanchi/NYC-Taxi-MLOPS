@@ -1,0 +1,109 @@
+services:
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.2
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_data:/mlflow
+    networks:
+      - nyc-taxi-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  prefect:
+    image: prefecthq/prefect:3-python3.11
+    ports:
+      - "4200:4200"
+    command: prefect server start --host 0.0.0.0 --port 4200
+    environment:
+      PREFECT_API_URL: http://0.0.0.0:4200/api
+    volumes:
+      - prefect_data:/root/.prefect
+    networks:
+      - nyc-taxi-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: src/serving/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+      - models_data:/app/models
+    environment:
+      MODEL_PATH: /app/models/model.pkl
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - nyc-taxi-net
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: src/ui/Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data:ro
+      - models_data:/app/models:ro
+    environment:
+      API_URL: http://api:8000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATA_PATH: /app/data
+    depends_on:
+      - api
+    networks:
+      - nyc-taxi-net
+    restart: unless-stopped
+
+  trainer:
+    build:
+      context: .
+      dockerfile: src/training/Dockerfile
+    profiles: ["training"]
+    volumes:
+      - ./data:/app/data:ro
+      - models_data:/app/models
+    environment:
+      DATA_PATH: /app/data
+      MODEL_OUTPUT_PATH: /app/models/model.pkl
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PREFECT_API_URL: http://prefect:4200/api
+      GIT_PYTHON_REFRESH: quiet
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      prefect:
+        condition: service_healthy
+    networks:
+      - nyc-taxi-net
+
+networks:
+  nyc-taxi-net:
+    driver: bridge
+
+volumes:
+  mlflow_data:
+  prefect_data:
+  models_data:
