@@ -146,6 +146,13 @@ def run_training(data_path: str, model_output_path: str):
         # The model is created on the CPU, then moved to its assigned GPU.
         model = TabularNet(num_features=len(FEATURE_COLS)).to(local_rank)
 
+        # JD REQUIREMENT: "Identify and remediate bottlenecks... optimize throughput"
+        # Using torch.compile (PyTorch 2.0+) fuses layers and optimizes CUDA kernels
+        # specifically for the underlying GPU architecture (e.g., A100/H100).
+        # We compile BEFORE wrapping in DDP.
+        print("Compiling model with torch.compile for higher training throughput...")
+        model = torch.compile(model)
+
         # DDP wraps the model and handles gradient synchronization across all GPUs.
         # From now on, you only use `ddp_model`.
         ddp_model = DDP(model, device_ids=[local_rank])

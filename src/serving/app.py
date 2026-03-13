@@ -3,11 +3,21 @@
 import os
 from typing import List
 
+import numpy as np
 import fsspec
 import joblib
 from fastapi import FastAPI, HTTPException
 import pandas as pd
 from pydantic import BaseModel, Field
+
+# Import feature logic for the Hybrid ONNX approach
+from src.features.transform import TemporalFeatureEngineer, FEATURE_COLS
+
+# Try importing ONNX Runtime for edge inference
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/model.pkl")
 
@@ -18,31 +28,49 @@ app = FastAPI(
 )
 
 model = None
+inference_mode = "sklearn" # Options: 'sklearn' or 'onnx'
+feature_engineer = TemporalFeatureEngineer() # Used for ONNX hybrid mode
 
-# At petabyte scale, the model artifact is not just the estimator (e.g., XGBoost)
-# but a full scikit-learn Pipeline that includes feature transformation steps.
-# This prevents training-serving skew by ensuring transformations are identical.
 
 @app.on_event("startup")
 async def load_model():
-    global model
+    global model, inference_mode
     try:
-        # In a production environment with multiple model frameworks, consider
-        # standardizing on a format like ONNX (Open Neural Network Exchange).
-        # The scikit-learn pipeline could be converted to ONNX (e.g., using skl2onnx)
-        # and served with a high-performance runtime like ONNX Runtime.
-        # This decouples the serving environment from the training framework.
-        # For now, we load the native scikit-learn object.
-        with fsspec.open(MODEL_PATH, "rb") as f:
-            model = joblib.load(f)
-        print(f"Model loaded from {MODEL_PATH}")
+        # 1. Fault Tolerant Loading: Check for ONNX first (High Performance / Edge)
+        if MODEL_PATH.endswith(".onnx"):
+            if ort is None:
+                print("⚠️ ONNX model found but `onnxruntime` is missing. Install it to use fast inference.")
+                return
+            
+            print(f"Loading ONNX model from {MODEL_PATH}...")
+            # Load bytes using fsspec (supports s3://, gs://, local)
+            with fsspec.open(MODEL_PATH, "rb") as f:
+                model_bytes = f.read()
+            
+            model = ort.InferenceSession(model_bytes)
+            inference_mode = "onnx"
+            print(f"✅ Loaded ONNX model (Mode: {inference_mode})")
+            
+        # 2. Fallback: Load Scikit-Learn Pipeline (Standard Cloud/Dev)
+        else:
+            print(f"Loading Pickle pipeline from {MODEL_PATH}...")
+            with fsspec.open(MODEL_PATH, "rb") as f:
+                model = joblib.load(f)
+            inference_mode = "sklearn"
+            print(f"✅ Loaded Sklearn pipeline (Mode: {inference_mode})")
+            
     except (FileNotFoundError, Exception) as e:
-        print(f"Could not load model from {MODEL_PATH}: {e}. Run `make train` first.")
+        print(f"❌ Critical Error: Could not load model from {MODEL_PATH}: {e}")
+        print("Tip: Run `make train` or update MODEL_PATH env var.")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok", 
+        "model_loaded": model is not None,
+        "inference_mode": inference_mode
+    }
 
 
 class TripFeatures(BaseModel):
@@ -76,9 +104,19 @@ async def predict(features: TripFeatures):
     # what the training pipeline expects.
     feature_df = pd.DataFrame([features.dict()])
     
-    # The pipeline handles all transformations (e.g., cyclical features, one-hot encoding)
-    # and then passes the result to the model for prediction.
-    predicted_fare = float(model.predict(feature_df)[0])
+    if inference_mode == "onnx":
+        # Hybrid Approach: Python Feature Eng -> ONNX Inference
+        # 1. Apply features (weekend, sin/cos) using the imported class
+        feature_df = feature_engineer.transform(feature_df)
+        # 2. Prepare float32 numpy array for ONNX
+        inputs = feature_df[FEATURE_COLS].astype("float32").to_numpy()
+        # 3. Run inference
+        input_name = model.get_inputs()[0].name
+        label_name = model.get_outputs()[0].name
+        predicted_fare = float(model.run([label_name], {input_name: inputs})[0][0])
+    else:
+        # Sklearn Approach: Pipeline handles everything
+        predicted_fare = float(model.predict(feature_df)[0])
     
     # Enforce business rule (minimum fare)
     predicted_fare = max(2.5, round(predicted_fare, 2))
@@ -97,8 +135,18 @@ async def predict_batch(features_list: List[TripFeatures]):
     # Create a DataFrame from the list of input features
     feature_df = pd.DataFrame([f.dict() for f in features_list])
 
-    # Get predictions for the entire batch
-    predicted_fares = model.predict(feature_df).tolist()
+    if inference_mode == "onnx":
+        # Hybrid Batch Inference
+        feature_df = feature_engineer.transform(feature_df)
+        inputs = feature_df[FEATURE_COLS].astype("float32").to_numpy()
+        
+        input_name = model.get_inputs()[0].name
+        label_name = model.get_outputs()[0].name
+        # Output might be shape (N, 1) or (N,) depending on export
+        results = model.run([label_name], {input_name: inputs})[0]
+        predicted_fares = [float(x) for x in results.flatten()]
+    else:
+        predicted_fares = model.predict(feature_df).tolist()
 
     # Apply business rule to each prediction
     processed_fares = [max(2.5, round(fare, 2)) for fare in predicted_fares]

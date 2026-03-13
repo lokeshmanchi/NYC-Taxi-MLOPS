@@ -21,3 +21,7 @@ plotly>=5.20.0
 
 python-dotenv>=1.0.0
 dask>=2024.1.0
+
+onnx>=1.16.0
+onnxruntime>=1.17.0
+skl2onnx>=1.16.0

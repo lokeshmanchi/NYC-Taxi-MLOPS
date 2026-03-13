@@ -61,6 +61,7 @@ graph LR
     *   **Data Parallelism (DDP):** We use PyTorch `DistributedDataParallel`. The dataset is sharded across $N$ GPUs. If we have 100 nodes with 8 GPUs each (800 total GPUs), the effective batch size becomes $B_{local} \times 800$.
     *   **Streaming I/O:** Traditional random-access DataLoaders crash RAM at this scale. Our `ParquetStreamingDataset` uses manifest-driven file discovery and `pyarrow` to stream partitioned Parquet data linearly from object storage, ensuring **O(1) memory usage** regardless of dataset size.
     *   **Network Optimization:** Gradients are synchronized using NCCL (NVIDIA Collective Communications Library) to minimize inter-node communication overhead.
+    *   **Throughput Optimization:** The model is compiled using `torch.compile` (PyTorch 2.0+), which fuses CUDA kernels and optimizes the execution graph for the specific GPU architecture (e.g., A100/H100), significantly increasing training throughput.
     *   **Model Registry Integration:** Both the XGBoost (`train.py`) and PyTorch DDP (`train_pytorch_ddp.py`) pipelines log their final models directly to the MLflow Model Registry, providing a unified location for versioned production artifacts.
 
 ## 3. Reliability & Failure Modes
@@ -80,7 +81,13 @@ In a distributed training run involving 500+ nodes, hardware failure is not a po
 *   **Batch Inference:** The API now provides a `/predict_batch` endpoint for high-throughput scoring of multiple records in a single request, reducing HTTP overhead and supporting production-scale inference.
 *   **Circuit Breakers:** (Planned) API clients should implement retries and circuit breakers to gracefully handle overloads; this is not yet present in the current codebase.
 
-### 3.3 Orchestration & Quality
+### 3.3 Edge & Hybrid Deployment
+*   **ONNX Standardization:** To support deployment on robotic nodes (which may run C++ stacks) or hardware accelerators (NVIDIA Jetson), the training pipeline exports models to **ONNX**.
+*   **Hybrid Inference Pattern:** The Serving API (`app.py`) implements a hybrid pattern:
+    1.  Lightweight feature engineering (sin/cos time features) runs in Python.
+    2.  Heavy compute (XGBoost inference) runs in `onnxruntime`, allowing for hardware acceleration and reduced dependency footprint.
+
+### 3.4 Orchestration & Quality
 *   **Workflow Management:** Prefect defines the end-to-end DAG, with tasks using retries and caching policies (`cache_key_fn`) to handle transient failures and avoid redundant computation.
 *   **Data Quality Monitoring:** A separate aggregation pipeline generates summary statistics (e.g., `hourly_summary.parquet`). The EDA dashboard loads only these summaries, ensuring instant dashboard performance even at petabyte scale.
 
@@ -91,6 +98,7 @@ In a distributed training run involving 500+ nodes, hardware failure is not a po
 | **I/O Bound** (Reading data is slower than GPU compute) | Prefetching & Caching | `DataLoader(..., num_workers=4, prefetch_factor=2)` hides I/O latency. |
 | **Network Bound** (Gradient sync takes too long) | Gradient Accumulation | Implemented in the DDP training loop. Gradients are accumulated locally for $N$ steps (configurable via `GRAD_ACCUMULATION_STEPS`) before a single network synchronization, reducing traffic. |
 | **Metadata Overhead** (Listing millions of files) | Manifest Files | Use a catalog (e.g., Hive Metastore) or manifest files instead of `glob` listing S3 buckets directly. |
+| **Compute Bound** (GPU underutilization) | JIT Compilation | `torch.compile` optimizes kernel fusion to maximize FLOPs utilization on modern GPUs. |
 
 ## Opportunities for Improvement
 
