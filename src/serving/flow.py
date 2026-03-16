@@ -9,6 +9,7 @@ To run this flow:
 $ prefect server start
 $ python -m src.orchestration.flow
 """
+
 import os
 import subprocess
 from prefect import flow, task
@@ -44,7 +45,9 @@ def run_training(processed_data_path: str):
 def etl_and_train_flow():
     """Main flow to run ETL and then launch the training job."""
     etl_output_path = os.getenv("PROCESSED_DATA_PATH", "data/processed")
-    run_etl(input_path=os.getenv("DATA_PATH", "data"), output_path=etl_output_path)
+    run_etl(
+        input_path=os.getenv("DATA_PATH", "data"), output_path=etl_output_path
+    )
     run_training(processed_data_path=etl_output_path)
 
 

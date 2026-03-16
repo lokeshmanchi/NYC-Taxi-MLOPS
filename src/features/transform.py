@@ -6,7 +6,6 @@ from typing import Tuple
 
 import fsspec
 import numpy as np
-import pandas as pd
 import dask.dataframe as dd
 from sklearn.base import BaseEstimator, TransformerMixin
 
@@ -38,7 +37,9 @@ def load_data(data_path: str = "data") -> dd.DataFrame:
         # dd.read_parquet reads the data lazily, creating a task graph.
         return dd.read_parquet(data_path)
     except Exception as e:
-        raise FileNotFoundError(f"Could not create Dask DataFrame from {data_path}: {e}")
+        raise FileNotFoundError(
+            f"Could not create Dask DataFrame from {data_path}: {e}"
+        )
 
 
 class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
@@ -52,15 +53,15 @@ class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
     def transform(self, X):
         # Create a copy to avoid SettingWithCopy warnings on the input df
         X = X.copy()
-        
+
         # Check for columns before computing to allow robust partial updates
         if "pickup_hour" in X.columns:
             X["hour_sin"] = np.sin(2 * np.pi * X["pickup_hour"] / 24)
             X["hour_cos"] = np.cos(2 * np.pi * X["pickup_hour"] / 24)
-            
+
         if "pickup_dayofweek" in X.columns:
             X["is_weekend"] = (X["pickup_dayofweek"] >= 5).astype(int)
-            
+
         return X
 
 
@@ -76,7 +77,8 @@ def filter_outliers(df: dd.DataFrame) -> dd.DataFrame:
 
 
 def engineer_features(df: dd.DataFrame) -> dd.DataFrame:
-    # With Dask, these operations build up the task graph. No computation happens yet.
+    # With Dask, these operations build up the task graph.
+    # No computation happens yet.
     df["lpep_pickup_datetime"] = dd.to_datetime(df["lpep_pickup_datetime"])
     df["pickup_hour"] = df["lpep_pickup_datetime"].dt.hour
     df["pickup_dayofweek"] = df["lpep_pickup_datetime"].dt.dayofweek
@@ -87,7 +89,9 @@ def engineer_features(df: dd.DataFrame) -> dd.DataFrame:
 
 
 def prepare_features(df: dd.DataFrame) -> Tuple[dd.DataFrame, dd.Series]:
-    """Prepares the raw feature set for training, before pipeline transformations."""
+    """
+    Prepares the raw feature set for training, before pipeline transformations.
+    """
     df = filter_outliers(df)
     df = engineer_features(df)
     df = df.dropna(subset=BASE_FEATURE_COLS + [TARGET_COL])
@@ -101,20 +105,22 @@ def save_processed_data(input_path: str, output_path: str):
     """
     print(f"Processing data from {input_path}...")
     df = load_data(input_path)
-    
+
     # Apply filters and base feature engineering.
     # Derived features (sin/cos, is_weekend) are NOT saved. They are generated
     # on-the-fly by the training loaders to ensure consistency.
     df = filter_outliers(df)
     df = engineer_features(df)
     df = df.dropna(subset=BASE_FEATURE_COLS + [TARGET_COL])
-    
+
     final_df = df[BASE_FEATURE_COLS + [TARGET_COL]]
-    
-    print(f"Saving processed data to {output_path} with Hive partitioning...")
+
+    print(
+        f"Saving processed data to {output_path} with Hive partitioning..."
+    )
     # By partitioning on a column like `pickup_month`, we enable downstream
-    # consumers to perform "predicate pushdown", reading only the data they need.
-    # This is a critical optimization for petabyte-scale data lakes.
+    # consumers to perform "predicate pushdown", reading only the data
+    # they need. This is a critical optimization for petabyte-scale lakes.
     final_df.to_parquet(
         output_path,
         write_index=False,
@@ -122,8 +128,8 @@ def save_processed_data(input_path: str, output_path: str):
         partition_on=["pickup_month"],
     )
 
-    # Create a manifest file to avoid slow `glob` or `list` operations in the training loader.
-    # This is a critical optimization for datasets with millions of partitions.
+    # Create a manifest file to avoid slow `glob` or `list` operations.
+    # This is critical for datasets with millions of partitions.
     fs, fs_path = fsspec.core.url_to_fs(output_path)
     # Use `fs.find` to recursively list all created parquet files.
     all_files = sorted(fs.find(fs_path, detail=False))

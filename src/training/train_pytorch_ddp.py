@@ -16,14 +16,16 @@ import mlflow
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import pandas as pd
 import pyarrow.parquet as pq
-import pyarrow.dataset as ds
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from src.features.transform import TemporalFeatureEngineer, FEATURE_COLS, BASE_FEATURE_COLS
-
+from src.features.transform import (
+    TemporalFeatureEngineer,
+    FEATURE_COLS,
+    BASE_FEATURE_COLS,
+    TARGET_COL,
+)
 
 
 def setup_ddp():
@@ -34,7 +36,7 @@ def setup_ddp():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    print(f"Starting DDP on rank {rank} (local rank {local_rank}) of {world_size} processes.")
+    print(f"Start DDP rank {rank} (local {local_rank}) of {world_size}.")
     return rank, local_rank, world_size
 
 
@@ -67,46 +69,62 @@ class ParquetStreamingDataset(IterableDataset):
     Streams data from Parquet files directly, without loading the full dataset into RAM.
     Handles sharding for Distributed Data Parallel (DDP).
     """
-    def __init__(self, data_path: str, rank: int, world_size: int, batch_size: int = 4096):
+
+    def __init__(
+        self,
+        data_path: str,
+        rank: int,
+        world_size: int,
+        batch_size: int = 4096,
+    ):
         self.data_path = data_path
         self.batch_size = batch_size
         self.feature_engineer = TemporalFeatureEngineer()
         self.columns = BASE_FEATURE_COLS + [TARGET_COL]
 
-        # Read the manifest file to get a list of all data partitions.
-        # This avoids a very slow and expensive listing operation on object storage.
+        # Read the manifest to get a list of all data partitions.
+        # Avoids expensive listing on object storage.
         manifest_path = os.path.join(self.data_path, "_manifest.json")
         fs, _ = fsspec.core.url_to_fs(manifest_path)
         with fs.open(manifest_path, "r") as f:
             all_files = json.load(f)
 
-        # DDP Sharding: Assign a unique subset of files to this specific GPU (rank).
+        # DDP Sharding: Assign subset of files to this GPU (rank).
         self.my_files = all_files[rank::world_size]
 
     def __iter__(self):
         worker_info = get_worker_info()
         files_to_process = self.my_files
-        
+
         # If using multiple workers per GPU, split the files again among workers
-        if worker_info is not None:
-            files_to_process = self.my_files[worker_info.id::worker_info.num_workers]
+        if worker_info:
+            wid = worker_info.id
+            wnum = worker_info.num_workers
+            files_to_process = self.my_files[wid::wnum]
 
         for file_path in files_to_process:
             # Use pyarrow to stream batches with column projection.
-            parquet_file = pq.ParquetFile(file_path, filesystem=fsspec.core.url_to_fs(file_path)[0])
-            for batch in parquet_file.iter_batches(batch_size=self.batch_size, columns=self.columns):
+            fs = fsspec.core.url_to_fs(file_path)[0]
+            parquet_file = pq.ParquetFile(file_path, filesystem=fs)
+            iter_b = parquet_file.iter_batches(
+                batch_size=self.batch_size, columns=self.columns
+            )
+            for batch in iter_b:
                 df_raw = batch.to_pandas()
-                
+
                 # Apply on-the-fly feature engineering to ensure consistency
                 df_transformed = self.feature_engineer.transform(df_raw)
-                
+
                 # The ETL job saved BASE_FEATURE_COLS + TARGET_COL.
                 X = df_transformed[FEATURE_COLS].values
                 y = df_raw["fare_amount"].values
 
-                # Yield a full batch at once. 
+                # Yield a full batch at once.
                 # We set batch_size=None in DataLoader to handle this correctly.
-                yield torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32).view(-1, 1)
+                yield (
+                    torch.tensor(X, dtype=torch.float32),
+                    torch.tensor(y, dtype=torch.float32).view(-1, 1),
+                )
 
 
 def run_training(data_path: str, model_output_path: str):
@@ -115,7 +133,9 @@ def run_training(data_path: str, model_output_path: str):
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4096"))
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
     GRAD_ACCUMULATION_STEPS = int(os.getenv("GRAD_ACCUMULATION_STEPS", "4"))
-    MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+    MLFLOW_TRACKING_URI = os.getenv(
+        "MLFLOW_TRACKING_URI", "http://localhost:5000"
+    )
     EXPERIMENT_NAME = "nyc-taxi-fare-prediction-ddp"
 
     rank, local_rank, world_size = setup_ddp()
@@ -123,7 +143,9 @@ def run_training(data_path: str, model_output_path: str):
     try:
         # 1. DATA PREPARATION
         # Initialize the streaming dataset. No data is loaded into RAM yet.
-        dataset = ParquetStreamingDataset(data_path, rank=rank, world_size=world_size, batch_size=BATCH_SIZE)
+        dataset = ParquetStreamingDataset(
+            data_path, rank=rank, world_size=world_size, batch_size=BATCH_SIZE
+        )
 
         # Set up MLflow tracking only on the master process
         if rank == 0:
@@ -138,19 +160,21 @@ def run_training(data_path: str, model_output_path: str):
                 "base_features": BASE_FEATURE_COLS,
             }
             mlflow.log_params(params)
-        
+
         # batch_size=None because the Dataset yields pre-batched tensors.
-        dataloader = DataLoader(dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=True)
+        dataloader = DataLoader(
+            dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=True
+        )
 
         # 2. MODEL INITIALIZATION
         # The model is created on the CPU, then moved to its assigned GPU.
         model = TabularNet(num_features=len(FEATURE_COLS)).to(local_rank)
 
-        # JD REQUIREMENT: "Identify and remediate bottlenecks... optimize throughput"
-        # Using torch.compile (PyTorch 2.0+) fuses layers and optimizes CUDA kernels
-        # specifically for the underlying GPU architecture (e.g., A100/H100).
+        # "Identify and remediate bottlenecks... optimize throughput"
+        # Using torch.compile (PyTorch 2.0+) fuses layers and optimizes CUDA
+        # kernels for the GPU architecture (e.g., A100/H100).
         # We compile BEFORE wrapping in DDP.
-        print("Compiling model with torch.compile for higher training throughput...")
+        print("Compiling model with torch.compile for higher throughput...")
         model = torch.compile(model)
 
         # DDP wraps the model and handles gradient synchronization across all GPUs.
@@ -188,21 +212,21 @@ def run_training(data_path: str, model_output_path: str):
 
                 outputs = ddp_model(inputs)
                 loss = criterion(outputs, targets)
-                
+
                 # Scale the loss for gradient accumulation
                 loss = loss / GRAD_ACCUMULATION_STEPS
                 loss.backward()  # Gradients are computed on each GPU.
 
                 if (i + 1) % GRAD_ACCUMULATION_STEPS == 0:
-                    optimizer.step() # Update weights
-                    optimizer.zero_grad() # Reset gradients
+                    optimizer.step()  # Update weights
+                    optimizer.zero_grad()  # Reset gradients
             # Log loss from the master process only to avoid spamming logs.
             epoch_loss = loss.item() * GRAD_ACCUMULATION_STEPS
             if rank == 0:
-                print(f"Epoch {epoch+1}/{5}, Loss: {epoch_loss:.4f}")
+                print(f"Epoch {epoch+1}, Loss: {epoch_loss:.4f}")
                 # Log metrics to MLflow
                 mlflow.log_metric("loss", epoch_loss, step=epoch)
-                
+
                 # Save checkpoint at the end of every epoch
                 print(f"Saving checkpoint to {checkpoint_path}")
                 checkpoint = {
@@ -221,7 +245,7 @@ def run_training(data_path: str, model_output_path: str):
             mlflow.pytorch.log_model(
                 pytorch_model=ddp_model.module,
                 artifact_path="model",
-                registered_model_name="nyc-taxi-regressor-ddp"
+                registered_model_name="nyc-taxi-regressor-ddp",
             )
             print(f"Model saved to {model_output_path}")
             mlflow.end_run()
@@ -235,5 +259,5 @@ if __name__ == "__main__":
     run_training(
         # Point to the PROCESSED data (the output of the ETL job)
         data_path=os.getenv("PROCESSED_DATA_PATH", "data/processed"),
-        model_output_path=os.getenv("MODEL_OUTPUT_PATH", "models/pytorch_model.pt"),
+        model_output_path=os.getenv("MODEL_OUTPUT_PATH", "models/model.pt"),
     )

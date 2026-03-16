@@ -7,14 +7,15 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from src.features.transform import FEATURE_COLS
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME = "nyc-taxi-fare-prediction"
 
-st.set_page_config(page_title="Model Performance — NYC Taxi", page_icon="🤖", layout="wide")
+st.set_page_config(
+    page_title="Model Performance — NYC Taxi", page_icon="🤖", layout="wide"
+)
 st.title("🤖 Model Performance")
-
-from src.features.transform import FEATURE_COLS
 
 
 @st.cache_data(ttl=30)
@@ -40,9 +41,9 @@ def load_model_feature_importance(tracking_uri: str, run_id: str):
         # Load the pipeline model logged by the training script
         model_uri = f"runs:/{run_id}/model"
         pipeline = mlflow.sklearn.load_model(model_uri)
-        
+
         # Extract the XGBoost model from the last step of the pipeline
-        xgb_model = pipeline.named_steps['model']
+        xgb_model = pipeline.named_steps["model"]
         scores = xgb_model.feature_importances_
         feature_names = FEATURE_COLS
         fi = pd.DataFrame({"feature": feature_names, "importance": scores})
@@ -56,7 +57,9 @@ def load_model_feature_importance(tracking_uri: str, run_id: str):
 exp, runs = load_mlflow_runs(MLFLOW_TRACKING_URI, EXPERIMENT_NAME)
 
 if exp is None:
-    st.warning("No MLflow experiment found. Run `make train` to train the model first.")
+    st.warning(
+        "No MLflow experiment found. Run `make train` to train the model first."
+    )
     st.stop()
 
 if isinstance(runs, str):
@@ -83,39 +86,75 @@ st.subheader("Feature Importance")
 fi = load_model_feature_importance(MLFLOW_TRACKING_URI, run_id)
 if fi is not None:
     fig = px.bar(
-        fi, x="importance", y="feature", orientation="h",
-        color="importance", color_continuous_scale="viridis",
+        fi,
+        x="importance",
+        y="feature",
+        orientation="h",
+        color="importance",
+        color_continuous_scale="viridis",
     )
-    fig.update_layout(showlegend=False, height=400, xaxis_title="Importance Score")
+    fig.update_layout(
+        showlegend=False, height=400, xaxis_title="Importance Score"
+    )
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("Feature importance unavailable (model artifact not found in MLflow).")
+    st.info(
+        "Feature importance unavailable (model artifact not found in MLflow)."
+    )
 
 # ── Run history table ─────────────────────────────────────────────────────────
 st.subheader("All Training Runs")
-display_cols = ["run_id", "start_time", "metrics.mae", "metrics.rmse", "metrics.r2",
-                "params.n_estimators", "params.max_depth", "params.learning_rate"]
+display_cols = [
+    "run_id",
+    "start_time",
+    "metrics.mae",
+    "metrics.rmse",
+    "metrics.r2",
+    "params.n_estimators",
+    "params.max_depth",
+    "params.learning_rate",
+]
 available = [c for c in display_cols if c in runs.columns]
 runs_display = runs[available].copy()
-runs_display.columns = [c.replace("metrics.", "").replace("params.", "") for c in available]
+runs_display.columns = [
+    c.replace("metrics.", "").replace("params.", "") for c in available
+]
 runs_display["run_id"] = runs_display["run_id"].str[:8]
-runs_display["start_time"] = pd.to_datetime(runs_display["start_time"]).dt.strftime("%Y-%m-%d %H:%M")
+runs_display["start_time"] = pd.to_datetime(
+    runs_display["start_time"]
+).dt.strftime("%Y-%m-%d %H:%M")
 st.dataframe(runs_display, use_container_width=True, hide_index=True)
 
 # ── MAE over runs ─────────────────────────────────────────────────────────────
 if "metrics.mae" in runs.columns and len(runs) > 1:
     st.subheader("MAE Across Runs")
-    history = runs[["start_time", "metrics.mae", "metrics.rmse"]].dropna().sort_values("start_time")
+    history = (
+        runs[["start_time", "metrics.mae", "metrics.rmse"]]
+        .dropna()
+        .sort_values("start_time")
+    )
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=history["start_time"], y=history["metrics.mae"],
-        mode="lines+markers", name="MAE",
-    ))
-    fig.add_trace(go.Scatter(
-        x=history["start_time"], y=history["metrics.rmse"],
-        mode="lines+markers", name="RMSE",
-    ))
-    fig.update_layout(xaxis_title="Run Time", yaxis_title="Error ($)", height=300)
+    fig.add_trace(
+        go.Scatter(
+            x=history["start_time"],
+            y=history["metrics.mae"],
+            mode="lines+markers",
+            name="MAE",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=history["start_time"],
+            y=history["metrics.rmse"],
+            mode="lines+markers",
+            name="RMSE",
+        )
+    )
+    fig.update_layout(
+        xaxis_title="Run Time", yaxis_title="Error ($)", height=300
+    )
     st.plotly_chart(fig, use_container_width=True)
 
-st.caption(f"MLflow experiment: `{EXPERIMENT_NAME}` · Tracking URI: `{MLFLOW_TRACKING_URI}`")
+st.caption(
+    f"MLflow experiment: `{EXPERIMENT_NAME}` · Tracking URI: `{MLFLOW_TRACKING_URI}`"
+)

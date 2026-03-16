@@ -1,7 +1,6 @@
 """EDA page — exploratory data analysis of NYC Green Taxi dataset."""
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -22,7 +21,9 @@ def load_summary_data(data_path: str) -> pd.DataFrame:
         # Spark/Dask job that aggregates petabytes of raw data.
         return pd.read_parquet(data_path)
     except FileNotFoundError:
-        st.error(f"Summary file not found at `{data_path}`. Run the aggregation pipeline first.")
+        st.error(
+            f"Summary file not found at `{data_path}`. Run the aggregation pipeline first."
+        )
         return None
 
 
@@ -31,13 +32,30 @@ hourly_summary = load_summary_data(HOURLY_SUMMARY_PATH)
 if hourly_summary is None:
     st.stop()
 
-st.info("Showing pre-aggregated summaries. At petabyte scale, live EDA on raw data is not feasible.")
+st.info(
+    "Showing pre-aggregated summaries. At petabyte scale, live EDA on raw data is not feasible."
+)
 
 st.subheader("Average Fare and Trip Count by Hour")
 st.caption("This data is loaded from a pre-aggregated summary file.")
 fig = go.Figure()
-fig.add_trace(go.Bar(x=hourly_summary["pickup_hour"], y=hourly_summary["trip_count"], name="Trip Count", yaxis="y"))
-fig.add_trace(go.Scatter(x=hourly_summary["pickup_hour"], y=hourly_summary["avg_fare"], name="Avg Fare ($)", yaxis="y2", mode="lines+markers"))
+fig.add_trace(
+    go.Bar(
+        x=hourly_summary["pickup_hour"],
+        y=hourly_summary["trip_count"],
+        name="Trip Count",
+        yaxis="y",
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=hourly_summary["pickup_hour"],
+        y=hourly_summary["avg_fare"],
+        name="Avg Fare ($)",
+        yaxis="y2",
+        mode="lines+markers",
+    )
+)
 fig.update_layout(
     xaxis_title="Hour of Day",
     yaxis=dict(title="Total Trips"),
