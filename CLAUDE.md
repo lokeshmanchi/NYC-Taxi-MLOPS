@@ -41,7 +41,25 @@ uvicorn src.serving.app:app --reload  # Serve API on :8000
 streamlit run src/ui/Home.py          # Run dashboard on :8501
 ```
 
+### Testing & linting
+```bash
+make test                                      # Run full pytest suite
+pytest src/features/test_features.py -v        # Run a single test file
+make format                                    # Run pre-commit hooks (flake8)
+pre-commit run --all-files                     # Lint all files manually
+```
+
+Flake8 is configured in `.flake8`: max-line-length=120, ignores W292/W293.
+
 ## Architecture
+
+### Configuration — `src/config.py`
+
+Central `pydantic.BaseSettings` class (`Settings`) with env var overrides. Key groups:
+- **Paths**: `model_path` (default `models/model.pkl`), `model_output_path`, `data_path`, `processed_data_path`
+- **MLflow**: `mlflow_tracking_uri`, `experiment_name`
+- **DDP**: `ddp_backend`, `rank`/`local_rank`/`world_size`, `batch_size`, `epochs`, `log_step_interval`
+- **Serving**: `max_batch_size` (default 256), `api_url`
 
 ### Feature Engineering — two-stage design
 
@@ -64,13 +82,34 @@ The whole pipeline is logged to MLflow via `mlflow.sklearn.log_model` (artifact 
 
 ### Model Serving — `src/serving/app.py`
 
-- Loads model via `fsspec.open(MODEL_PATH)` — `MODEL_PATH` supports cloud URIs
-- Accepts `BASE_FEATURE_COLS` as input (no `is_weekend` — the pipeline generates it)
-- Calls `pipeline.predict(pd.DataFrame([features.dict()]))` — pipeline handles all transforms
+Hybrid ONNX/sklearn serving via a lifespan context manager:
+1. On startup, attempts to load an ONNX model first (if available at `model_output_path`)
+2. Falls back to loading the sklearn pipeline via `fsspec.open(MODEL_PATH)` (supports cloud URIs)
+3. Endpoints: `GET /health`, `POST /predict` (single), `POST /predict_batch` (up to `max_batch_size`)
+- Accepts `BASE_FEATURE_COLS` as input; the pipeline/ONNX session handles all transforms.
 
-**Limitation:** The current API can only serve the scikit-learn/XGBoost pipeline artifact. It cannot load the PyTorch model.
+**Important:** `MODEL_PATH` defaults to `models/model.pkl`. After retraining, either download the MLflow artifact to that path or update `MODEL_PATH` to `runs:/<run_id>/model`.
 
-**Important:** `MODEL_PATH` defaults to `models/model.pkl`. After retraining, you must either download the artifact from MLflow and place it at that path, or update `MODEL_PATH` to an MLflow model URI (`runs:/<run_id>/model`).
+### Edge Inference — `src/training/edge_run.py`
+
+Standalone ONNX inference for edge/offline devices:
+- Auto-selects hardware accelerator (CUDA → CoreML → CPU)
+- Applies `TemporalFeatureEngineer` in Python, then runs ONNX session
+- Enforces business logic (min fare $2.50)
+
+### Prefect Orchestration — two flows
+
+| File | Flow | Purpose |
+|------|------|---------|
+| `src/pipelines/training_flow.py` | `training_pipeline` | Wraps `train.py` with retry logic (1 retry, 30s delay) |
+| `src/serving/flow.py` | `etl_and_train_flow` | Runs Dask ETL then launches `torchrun` for DDP training |
+
+### Distributed Training — `src/training/train_pytorch_ddp.py`
+
+- `TabularNet`: MLP (128→64→1 with dropout)
+- `ParquetStreamingDataset(IterableDataset)`: Streams rows from Parquet via `_manifest.json` — O(1) RAM
+- DDP init: reads `torchrun` env vars, falls back NCCL→Gloo
+- `save_processed_data()` writes a `_manifest.json` alongside partitioned Parquet so DDP workers can enumerate files in O(1) without cloud list operations
 
 ### EDA Dashboard — `src/ui/pages/1_EDA.py`
 
