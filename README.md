@@ -4,46 +4,51 @@
 
 ```mermaid
 flowchart TD
-    A["Raw Data (Parquet)"] -->|Dask Lazy Load| B["Base Feature Engineering (Transform.py)"]
-    B -->|Filtered & Engineered| C["Processed Data Parquet"]
-    C -->|Stream w/ Manifest| E2["Distributed Training (PyTorch DDP)"]
-    E2 -->|Log Model| F["MLflow Model Registry"]
+    A["Raw Data (Parquet)"] -->|Dask Lazy Load| B["ETL (transform.py)\nfilter + engineer features"]
+    B -->|Hive-partitioned Parquet\n+ _manifest.json + hourly_summary| C["Processed Data"]
+    C -->|Stream w/ Manifest| E2["Distributed Training\n(PyTorch DDP)"]
+    E2 -->|Log nyc-taxi-regressor-ddp| F["MLflow Model Registry"]
     A -->|Load & Transform| D["Train/Test Split"]
-    D -->|Pandas DataFrame| E["Model Training (XGBoost)"]
-    E -->|Log Pipeline| F
-    F -->|XGBoost/ONNX Artifact| G["Model Serving API (FastAPI, Hybrid)"]
-    G -->|Prediction| H["User/API Client"]
-    C -.->|Separate Aggregation Job| I["EDA Dashboard (Streamlit)"]
-    F -.->|Load Pipeline| J["Model Performance Dashboard"]
-    subgraph Orchestration
-      K["Prefect Flow"]
+    D -->|Pandas DataFrame| E["XGBoost Training\n(train.py)"]
+    E -->|Log nyc-taxi-regressor\n+ ONNX artifact| F
+    F -->|Model Artifact| G["Model Serving API\n(FastAPI — Hybrid ONNX/sklearn)"]
+    G -->|Prediction + log row| P["Prediction Logs\n(data/predictions/)"]
+    P -->|Evidently comparison| MON["GET /monitoring/drift\n(HTML drift report)"]
+    G -->|Fare prediction| H["User / API Client"]
+    C -->|hourly_summary.parquet| I["EDA Dashboard\n(1_EDA.py)"]
+    F -->|Load pipeline| J["Model Performance\n(2_Model_Performance.py)"]
+    G -->|POST /predict| N["Live Prediction\n(3_Predict.py)"]
+    subgraph Prefect_Orchestration
+      K1["training_pipeline\n(pipelines/training_flow.py)"]
+      K2["etl_and_train_flow\n(serving/flow.py)"]
     end
-    K -->|Run| B
-    K -->|Launch| E2
+    K1 -->|Wraps with retry| E
+    K2 -->|Runs ETL| B
+    K2 -->|Launches torchrun| E2
     subgraph Experiment_Tracking
       L["MLflow"]
     end
     E -.-> L
     E2 -.-> L
-    J -.->|Fetch Run Data| L
+    J -.->|Fetch run data| L
 ```
 
 ### Diagram Explanation
 
 This diagram illustrates the end-to-end MLOps pipeline for NYC Taxi fare prediction:
 
-- **Raw Data (Parquet):** Source data files, loaded lazily using Dask for scalability.
-- **Base Feature Engineering (Transform.py):** Cleans and engineers base features using Dask (see `src/features/transform.py`).
-- **Processed Data Parquet:** Output of feature engineering, partitioned and ready for training.
-- **Train/Test Split → Model Training (XGBoost):** Local training path. Data is materialized to Pandas, split, and used to train an XGBoost pipeline (see `src/training/train.py`).
-- **Stream w/ Manifest → Distributed Training (PyTorch DDP):** Distributed training path. Data is streamed directly from Parquet using a manifest file for efficient sharding and processed by PyTorch DDP with `torch.compile` optimization (see `src/training/train_pytorch_ddp.py`).
-- **MLflow Model Registry:** Both training paths log their models to MLflow for experiment tracking and model registry.
-- **Model Serving API (FastAPI, Hybrid):** Serves predictions using either the XGBoost pipeline (Cloud) or ONNX artifact (Edge) (see `src/serving/app.py`).
-- **User/API Client:** Consumes predictions from the API.
-- **EDA Dashboard (Streamlit):** Loads pre-aggregated summaries for exploratory data analysis (see `src/ui/pages/1_EDA.py`).
-- **Model Performance Dashboard:** Loads the pipeline from MLflow to display metrics and feature importances (see `src/ui/pages/2_Model_Performance.py`).
-- **Prefect Flow:** Orchestrates ETL and distributed training (see `src/serving/flow.py`).
-- **MLflow:** Used for experiment tracking, metrics, and model registry.
+- **Raw Data (Parquet):** Source NYC TLC green taxi parquet files (~48k rows/month), loaded lazily using Dask for scalability.
+- **ETL (transform.py):** Cleans and engineers base features using Dask (`filter_outliers`, `engineer_features`). Writes Hive-partitioned Parquet, a `_manifest.json` for O(1) file discovery, and auto-generates `hourly_summary.parquet` for the EDA dashboard.
+- **Processed Data:** Hive-partitioned Parquet (by `pickup_month`) containing `BASE_FEATURE_COLS + fare_amount`. Derived temporal features (`is_weekend`, `hour_sin`, `hour_cos`) are never stored — always generated on-the-fly by `TemporalFeatureEngineer`.
+- **XGBoost Training (train.py):** Materializes Dask to Pandas, fits a `sklearn.Pipeline([TemporalFeatureEngineer, XGBRegressor])`, logs to MLflow as `nyc-taxi-regressor`, and exports an INT8-quantized ONNX artifact for edge deployment.
+- **Distributed Training (PyTorch DDP):** Streams Parquet data via `_manifest.json` (O(1) RAM), trains `TabularNet` (MLP 128→64→1) with gradient accumulation, AMP, and `torch.compile`. Logs to MLflow as `nyc-taxi-regressor-ddp`. Exports ONNX for edge.
+- **MLflow Model Registry:** Central artifact store for both training paths. Experiment tracking, metrics, and model versioning.
+- **Model Serving API (FastAPI, Hybrid):** On startup, loads ONNX if available, otherwise sklearn pipeline. Serves `POST /predict` (single), `POST /predict_batch` (up to `MAX_BATCH_SIZE`). Logs every prediction to `data/predictions/` (date-partitioned Parquet).
+- **GET /monitoring/drift:** Generates an [Evidently](https://docs.evidentlyai.com/) HTML data drift report comparing `data/processed/` (reference) against `data/predictions/` (live inputs).
+- **EDA Dashboard (1_EDA.py):** Loads `data/summary/hourly_summary.parquet` (auto-generated by ETL) for exploratory data analysis.
+- **Model Performance (2_Model_Performance.py):** Loads the sklearn pipeline from MLflow, extracts the XGBRegressor to display feature importances and eval metrics.
+- **Live Prediction (3_Predict.py):** Streamlit form that calls `POST /predict` and displays the returned fare.
+- **Prefect Orchestration:** Two distinct flows — `training_pipeline` wraps XGBoost training with retry logic; `etl_and_train_flow` runs Dask ETL then launches `torchrun` for DDP.
 
 Each component in the diagram maps directly to a module or script in the codebase, ensuring reproducibility, scalability, and clear separation of concerns.
 
@@ -53,7 +58,7 @@ While the documentation highlights cloud scalability, the architecture is design
 
 - **Edge Robotic Systems:** This pipeline can be containerized and deployed to edge robotic systems using the same Docker/Kubernetes logic used in the cloud.
 - **Storage Independence:** The codebase utilizes `fsspec` (in `transform.py` and `app.py`), allowing seamless switching between cloud storage (S3/GCS) and local on-premise storage (MinIO, NFS) without code changes.
-- **Low-Latency Inference:** For resource-constrained edge devices, the architecture supports exporting models to ONNX (Open Neural Network Exchange) to run on specialized hardware accelerators.
+- **Low-Latency Inference:** For resource-constrained edge devices, the architecture supports exporting models to ONNX (Open Neural Network Exchange) to run on specialized hardware accelerators (TensorRT → CUDA → CPU). `edge_run.py` adds LRU caching, OTA hot-swap, and a distance-based heuristic fallback for SLA compliance.
 
 ## Production Hardening and Scalability Enhancements
 
@@ -63,6 +68,6 @@ The following improvements are now implemented in code to target petabyte scale 
 - ETL writes a `_manifest.json` with `.parquet` file paths to avoid expensive list operations at scale.
 - PyTorch training is configurable via env vars: `EPOCHS`, `BATCH_SIZE`, `NUM_WORKERS`, `GRAD_ACCUMULATION_STEPS`, `LOG_STEP_INTERVAL`.
 - Training includes checkpoint resume, local step-based MLflow metric logging, and CPU/GPU warmup paths.
-- Serving has a `MAX_BATCH_SIZE` guard, warmup modeling, and ONNX/sklearn fallback behavior.
-- Prefect flow now supports `NPROC_PER_NODE`, `RDZV_ENDPOINT`, and can run on multi-node clusters.
-
+- Serving has a `MAX_BATCH_SIZE` guard, warmup inference on startup, and ONNX/sklearn fallback behavior.
+- Prefect flow supports `NPROC_PER_NODE`, `RDZV_ENDPOINT`, and can run on multi-node clusters.
+- Prediction inputs are logged to `data/predictions/` and exposed via `GET /monitoring/drift` (Evidently).

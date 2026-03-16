@@ -7,7 +7,7 @@ This workflow defines the Directed Acyclic Graph (DAG) for a full MLOps run:
 
 To run this flow:
 $ prefect server start
-$ python -m src.orchestration.flow
+$ python -m src.serving.flow
 """
 
 import subprocess
