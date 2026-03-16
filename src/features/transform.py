@@ -5,26 +5,10 @@ import json
 from typing import Tuple
 
 import fsspec
-import numpy as np
 import dask.dataframe as dd
-from sklearn.base import BaseEstimator, TransformerMixin
 
-# Base features that are read from the source or cleaned.
-BASE_FEATURE_COLS = [
-    "trip_distance",
-    "passenger_count",
-    "PULocationID",
-    "DOLocationID",
-    "pickup_hour",
-    "pickup_dayofweek",
-    "pickup_month",
-    "RatecodeID",
-]
-
-# Final feature set after on-the-fly transformation.
-FEATURE_COLS = BASE_FEATURE_COLS + ["is_weekend", "hour_sin", "hour_cos"]
-
-TARGET_COL = "fare_amount"
+from src.config import config
+from src.features.core import BASE_FEATURE_COLS, TARGET_COL
 
 
 def load_data(data_path: str = "data") -> dd.DataFrame:
@@ -37,31 +21,12 @@ def load_data(data_path: str = "data") -> dd.DataFrame:
         # dd.read_parquet reads the data lazily, creating a task graph.
         return dd.read_parquet(data_path)
     except Exception as e:
-        raise FileNotFoundError(f"Could not create Dask DataFrame from {data_path}: {e}")
+        raise FileNotFoundError(
+            f"Could not create Dask DataFrame from {data_path}: {e}"
+        )
 
 
-class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
-    """
-    Scikit-learn compatible transformer to generate temporal features.
-    Ensures identical logic is applied during Training and Serving.
-    """
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        # Create a copy to avoid SettingWithCopy warnings on the input df
-        X = X.copy()
-
-        # Check for columns before computing to allow robust partial updates
-        if "pickup_hour" in X.columns:
-            X["hour_sin"] = np.sin(2 * np.pi * X["pickup_hour"] / 24)
-            X["hour_cos"] = np.cos(2 * np.pi * X["pickup_hour"] / 24)
-
-        if "pickup_dayofweek" in X.columns:
-            X["is_weekend"] = (X["pickup_dayofweek"] >= 5).astype(int)
-
-        return X
+# `TemporalFeatureEngineer` is defined in `src/features/core.py`.
 
 
 def filter_outliers(df: dd.DataFrame) -> dd.DataFrame:
@@ -129,7 +94,9 @@ def save_processed_data(input_path: str, output_path: str):
     # This is critical for datasets with millions of partitions.
     fs, fs_path = fsspec.core.url_to_fs(output_path)
     # Use `fs.find` to recursively list all created parquet files.
-    all_files = sorted([p for p in fs.find(fs_path, detail=False) if p.endswith(".parquet")])
+    all_files = sorted(
+        [p for p in fs.find(fs_path, detail=False) if p.endswith(".parquet")]
+    )
     manifest_path = os.path.join(output_path, "_manifest.json")
     print(f"Writing manifest for {len(all_files)} files to {manifest_path}...")
     with fs.open(manifest_path, "w") as f:
@@ -141,6 +108,4 @@ def save_processed_data(input_path: str, output_path: str):
 if __name__ == "__main__":
     # Allow running this script directly to materialize the dataset
     # Usage: python -m src.features.transform
-    INPUT_PATH = os.getenv("DATA_PATH", "data")
-    OUTPUT_PATH = os.getenv("PROCESSED_DATA_PATH", "data/processed")
-    save_processed_data(INPUT_PATH, OUTPUT_PATH)
+    save_processed_data(config.data_path, config.processed_data_path)

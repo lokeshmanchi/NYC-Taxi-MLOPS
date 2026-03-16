@@ -1,10 +1,10 @@
 """Prefect training pipeline for NYC Taxi fare prediction."""
 
-import os
 from typing import Optional
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
+from src.config import config
 
 
 @task(name="train-xgboost", retries=1, retry_delay_seconds=30)
@@ -32,13 +32,9 @@ def training_pipeline(
     model_output_path: Optional[str] = None,
     mlflow_tracking_uri: Optional[str] = None,
 ) -> str:
-    data_path = data_path or os.getenv("DATA_PATH", "data")
-    model_output_path = model_output_path or os.getenv(
-        "MODEL_OUTPUT_PATH", "models/model.pkl"
-    )
-    mlflow_tracking_uri = mlflow_tracking_uri or os.getenv(
-        "MLFLOW_TRACKING_URI", "http://localhost:5000"
-    )
+    data_path = data_path or config.data_path
+    model_output_path = model_output_path or config.model_output_path
+    mlflow_tracking_uri = mlflow_tracking_uri or config.mlflow_tracking_uri
 
     run_id = train_task(data_path, model_output_path, mlflow_tracking_uri)
     return run_id

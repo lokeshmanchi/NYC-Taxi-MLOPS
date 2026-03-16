@@ -1,7 +1,6 @@
 """FastAPI model serving for NYC Taxi fare prediction."""
 
 import logging
-import os
 from typing import List
 from contextlib import asynccontextmanager
 
@@ -12,7 +11,8 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 # Import feature logic for the Hybrid ONNX approach
-from src.features.transform import TemporalFeatureEngineer, FEATURE_COLS
+from src.config import config
+from src.features.core import TemporalFeatureEngineer, FEATURE_COLS
 
 # Try importing ONNX Runtime for edge inference
 try:
@@ -24,8 +24,8 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nyc-taxi-api")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "models/model.pkl")
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "256"))
+MODEL_PATH = config.model_path
+MAX_BATCH_SIZE = config.max_batch_size
 
 model = None
 inference_mode = "sklearn"  # Options: 'sklearn' or 'onnx'
@@ -40,7 +40,10 @@ async def lifespan(app: FastAPI):
         # 1. Fault Tolerant Loading: Check for ONNX first (High Performance / Edge)
         if MODEL_PATH.endswith(".onnx"):
             if ort is None:
-                logger.warning("ONNX model found but `onnxruntime` is missing. " "Install it to use fast inference.")
+                logger.warning(
+                    "ONNX model found but `onnxruntime` is missing. "
+                    "Install it to use fast inference."
+                )
             else:
                 logger.info(f"Loading ONNX model from {MODEL_PATH}...")
                 # Load bytes using fsspec (supports s3://, gs://, local)
@@ -127,9 +130,13 @@ class TripFeatures(BaseModel):
     # Note: is_weekend is no longer needed. The model pipeline will generate it
     # from the raw features below.
     pickup_hour: int = Field(..., ge=0, le=23, example=14)
-    pickup_dayofweek: int = Field(..., ge=0, le=6, example=2, description="0=Monday, 6=Sunday")
+    pickup_dayofweek: int = Field(
+        ..., ge=0, le=6, example=2, description="0=Monday, 6=Sunday"
+    )
     pickup_month: int = Field(..., ge=1, le=12, example=3)
-    RatecodeID: int = Field(1, ge=1, le=6, example=1, description="1=Standard, 2=JFK, 3=Newark")
+    RatecodeID: int = Field(
+        1, ge=1, le=6, example=1, description="1=Standard, 2=JFK, 3=Newark"
+    )
 
 
 class PredictionResponse(BaseModel):
@@ -160,7 +167,8 @@ async def predict(features: TripFeatures):
         # 3. Run inference
         input_name = model.get_inputs()[0].name
         label_name = model.get_outputs()[0].name
-        predicted_fare = float(model.run([label_name], {input_name: inputs})[0][0])
+        res = model.run([label_name], {input_name: inputs})
+        predicted_fare = float(res[0][0])
     else:
         # Sklearn Approach: Pipeline handles everything
         predicted_fare = float(model.predict(feature_df)[0])

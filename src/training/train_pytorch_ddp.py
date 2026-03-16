@@ -19,23 +19,28 @@ import torch.nn as nn
 import pyarrow.parquet as pq
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.cuda.amp import GradScaler
 
-from src.features.transform import (
+from src.features.core import (
     TemporalFeatureEngineer,
     FEATURE_COLS,
     BASE_FEATURE_COLS,
     TARGET_COL,
 )
+from src.config import config
 
 
 def setup_ddp():
     """Initializes the distributed environment from environment variables."""
-    backend = os.getenv("DDP_BACKEND", "nccl")
+    backend = config.ddp_backend
     try:
         dist.init_process_group(backend=backend)
     except Exception as e:
         if backend == "nccl":
-            print("Warning: NCCL init failed, falling back to gloo (CPU or mixed).", e)
+            print(
+                "Warning: NCCL init failed, falling back to gloo (CPU or mixed).",
+                e
+            )
             dist.init_process_group(backend="gloo")
             backend = "gloo"
         else:
@@ -122,9 +127,13 @@ class ParquetStreamingDataset(IterableDataset):
             wnum = worker_info.num_workers
             files_to_process = self.my_files[wid::wnum]
 
+        # Initialize filesystem INSIDE the worker process.
+        # S3/GCS connections are often not fork-safe and shouldn't be shared across workers.
+        # 'use_listings_cache=False' prevents stale metadata issues in long-running jobs.
+        fs, _ = fsspec.core.url_to_fs(self.data_path, use_listings_cache=False)
+
         for file_path in files_to_process:
             # Use pyarrow to stream batches with column projection.
-            fs = fsspec.core.url_to_fs(file_path)[0]
             parquet_file = pq.ParquetFile(file_path, filesystem=fs)
             iter_b = parquet_file.iter_batches(batch_size=self.batch_size, columns=self.columns)
             for batch in iter_b:
@@ -147,14 +156,14 @@ class ParquetStreamingDataset(IterableDataset):
 
 def run_training(data_path: str, model_output_path: str):
     """Main DDP training function."""
-    # Configuration from env vars for tuning at scale
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4096"))
-    NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
-    GRAD_ACCUMULATION_STEPS = int(os.getenv("GRAD_ACCUMULATION_STEPS", "4"))
-    EPOCHS = int(os.getenv("EPOCHS", "5"))
-    LOG_STEP_INTERVAL = int(os.getenv("LOG_STEP_INTERVAL", "100"))
-    MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-    EXPERIMENT_NAME = "nyc-taxi-fare-prediction-ddp"
+    # Configuration from centralized config
+    BATCH_SIZE = config.batch_size
+    NUM_WORKERS = config.num_workers
+    GRAD_ACCUMULATION_STEPS = config.grad_accumulation_steps
+    EPOCHS = config.epochs
+    LOG_STEP_INTERVAL = config.log_step_interval
+    MLFLOW_TRACKING_URI = config.mlflow_tracking_uri
+    EXPERIMENT_NAME = config.experiment_name + "-ddp"
 
     rank, local_rank, world_size = setup_ddp()
 
@@ -197,6 +206,8 @@ def run_training(data_path: str, model_output_path: str):
 
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(ddp_model.parameters(), lr=0.001)
+        # Initialize GradScaler for Mixed Precision (AMP) training
+        scaler = GradScaler(enabled=(config.ddp_backend == "nccl"))
 
         # 2.1 ELASTIC CHECKPOINTING
         # Load from S3/local checkpoint if it exists to recover from failures
@@ -214,6 +225,9 @@ def run_training(data_path: str, model_output_path: str):
                 checkpoint = torch.load(f, map_location=f"cuda:{local_rank}")
             ddp_model.module.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # Load scaler state if available (crucial for resuming AMP training)
+            if "scaler_state_dict" in checkpoint:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
             start_epoch = checkpoint["epoch"] + 1
 
         # 3. TRAINING LOOP
@@ -226,16 +240,25 @@ def run_training(data_path: str, model_output_path: str):
                 inputs = inputs.to(local_rank)
                 targets = targets.to(local_rank)
 
-                outputs = ddp_model(inputs)
-                loss = criterion(outputs, targets)
+                # Mixed Precision Context
+                with torch.amp.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                    enabled=(config.ddp_backend == "nccl")
+                ):
+                    outputs = ddp_model(inputs)
+                    loss = criterion(outputs, targets)
+                    # Scale the loss for gradient accumulation
+                    loss = loss / GRAD_ACCUMULATION_STEPS
+
                 epoch_loss += loss.item()
 
-                # Scale the loss for gradient accumulation
-                loss = loss / GRAD_ACCUMULATION_STEPS
-                loss.backward()
+                # Backward pass with scaling
+                scaler.scale(loss).backward()
 
                 if (i + 1) % GRAD_ACCUMULATION_STEPS == 0:
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
 
                 global_step += 1
@@ -254,6 +277,7 @@ def run_training(data_path: str, model_output_path: str):
                     "epoch": epoch,
                     "model_state_dict": ddp_model.module.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                 }
                 with fs.open(cp_fs_path, "wb") as f:
                     torch.save(checkpoint, f)
@@ -278,7 +302,6 @@ def run_training(data_path: str, model_output_path: str):
 
 if __name__ == "__main__":
     run_training(
-        # Point to the PROCESSED data (the output of the ETL job)
-        data_path=os.getenv("PROCESSED_DATA_PATH", "data/processed"),
-        model_output_path=os.getenv("MODEL_OUTPUT_PATH", "models/model.pt"),
+        data_path=config.processed_data_path,
+        model_output_path=config.model_output_path,
     )

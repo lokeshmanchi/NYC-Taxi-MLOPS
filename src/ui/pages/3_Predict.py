@@ -1,11 +1,11 @@
 """Live Prediction page — call the FastAPI model endpoint."""
 
-import os
+from src.config import config
 
 import httpx
 import streamlit as st
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = config.api_url
 
 st.set_page_config(page_title="Live Prediction — NYC Taxi", page_icon="🔮", layout="centered")
 st.title("🔮 Live Fare Prediction")

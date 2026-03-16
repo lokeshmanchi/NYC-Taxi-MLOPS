@@ -3,6 +3,8 @@
 import logging
 import os
 
+from src.config import config
+
 import mlflow
 import numpy as np
 import xgboost as xgb
@@ -17,13 +19,12 @@ except ImportError:
     to_onnx = None
     print("⚠️ ONNX tools missing. ONNX export will be skipped.")
 
-from src.features.transform import (
+from src.features.core import (
     BASE_FEATURE_COLS,
     FEATURE_COLS,
-    load_data,
-    prepare_features,
     TemporalFeatureEngineer,
 )
+from src.features.transform import load_data, prepare_features
 
 EXPERIMENT_NAME = "nyc-taxi-fare-prediction"
 
@@ -152,8 +153,6 @@ def train(
 
 if __name__ == "__main__":
     train(
-        data_path=os.getenv("DATA_PATH", "data"),
-        mlflow_tracking_uri=os.getenv(
-            "MLFLOW_TRACKING_URI", "http://localhost:5000"
-        ),
+        data_path=config.data_path,
+        mlflow_tracking_uri=config.mlflow_tracking_uri,
     )

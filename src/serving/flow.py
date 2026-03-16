@@ -10,12 +10,13 @@ $ prefect server start
 $ python -m src.orchestration.flow
 """
 
-import os
 import subprocess
-from prefect import flow, task
-from prefect.tasks import task_input_hash
 from datetime import timedelta
 
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+
+from src.config import config
 from src.features.transform import save_processed_data
 
 
@@ -34,15 +35,18 @@ def run_etl(input_path: str, output_path: str):
 @task(name="Launch Distributed Training")
 def run_training(processed_data_path: str):
     """Prefect task to launch the PyTorch DDP training script."""
-    nproc = os.getenv("NPROC_PER_NODE", "2")
-    rdzv_endpoint = os.getenv("RDZV_ENDPOINT")
-    rdzv_id = os.getenv("RDZV_ID", "ddp_run")
+    nproc = config.nproc_per_node
+    rdzv_endpoint = config.rdzv_endpoint
+    rdzv_id = config.rdzv_id
     rdzv_args = ""
 
     if rdzv_endpoint:
-        rdzv_args = f" --rdzv_id {rdzv_id} --rdzv_backend c10d --rdzv_endpoint {rdzv_endpoint}"
+        rdzv_args = (
+            f" --rdzv_id {rdzv_id} --rdzv_backend c10d "
+            f"--rdzv_endpoint {rdzv_endpoint}"
+        )
 
-    command = f"torchrun --standalone --nproc_per_node={nproc}{rdzv_args} " "src/training/train_pytorch_ddp.py"
+    command = f"torchrun --standalone --nproc_per_node={nproc}{rdzv_args} src/training/train_pytorch_ddp.py"  # noqa: E501
     print(f"Executing command: {command}")
     subprocess.run(command, shell=True, check=True)
 
@@ -50,8 +54,8 @@ def run_training(processed_data_path: str):
 @flow(name="NYC Taxi - ETL & Training Pipeline")
 def etl_and_train_flow():
     """Main flow to run ETL and then launch the training job."""
-    etl_output_path = os.getenv("PROCESSED_DATA_PATH", "data/processed")
-    run_etl(input_path=os.getenv("DATA_PATH", "data"), output_path=etl_output_path)
+    etl_output_path = config.processed_data_path
+    run_etl(input_path=config.data_path, output_path=etl_output_path)
     run_training(processed_data_path=etl_output_path)
 
 

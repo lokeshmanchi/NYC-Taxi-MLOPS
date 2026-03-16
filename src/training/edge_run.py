@@ -21,7 +21,7 @@ import pandas as pd
 
 # Ensure we can import the project modules
 sys.path.append(".")
-from src.features.transform import (  # noqa: E402
+from src.features.core import (  # noqa: E402
     FEATURE_COLS,
     TemporalFeatureEngineer,
 )

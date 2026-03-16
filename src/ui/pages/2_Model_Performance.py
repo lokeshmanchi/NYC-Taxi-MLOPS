@@ -1,16 +1,16 @@
 """Model Performance page — MLflow metrics and feature importance."""
 
-import os
+from src.config import config
 
 import mlflow
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from src.features.transform import FEATURE_COLS
+from src.features.core import FEATURE_COLS
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-EXPERIMENT_NAME = "nyc-taxi-fare-prediction"
+MLFLOW_TRACKING_URI = config.mlflow_tracking_uri
+EXPERIMENT_NAME = config.experiment_name
 
 st.set_page_config(
     page_title="Model Performance — NYC Taxi", page_icon="🤖", layout="wide"
