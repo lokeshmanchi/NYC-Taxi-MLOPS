@@ -110,7 +110,13 @@ class ParquetStreamingDataset(IterableDataset):
 
         if fs.exists(fs_path):
             with fs.open(manifest_path, "r") as f:
-                all_files = json.load(f)
+                manifest = json.load(f)
+            # Handle both new dict format (v1) and legacy list format (v0)
+            if isinstance(manifest, dict):
+                all_files = manifest["files"]
+                print(f"[Rank {rank}] Data snapshot hash: {manifest.get('snapshot_hash', 'n/a')[:8]}...")
+            else:
+                all_files = manifest
         else:
             print(f"Manifest file not found at {manifest_path}, using fs.find() fallback.")
             all_files = sorted(p for p in fs.find(self.data_path, detail=False) if p.endswith(".parquet"))

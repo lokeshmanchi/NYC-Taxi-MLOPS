@@ -1,8 +1,10 @@
 """Feature engineering for NYC Green Taxi fare prediction."""
 
+import hashlib
 import os
 import json
 import warnings
+from datetime import datetime, timezone
 from typing import Tuple
 
 import fsspec
@@ -22,6 +24,41 @@ REQUIRED_RAW_COLS = [
     "DOLocationID",
     "RatecodeID",
 ]
+
+
+def compute_data_hash(path: str, fs=None) -> str:
+    """Compute a reproducible snapshot hash for a directory of parquet files.
+    Uses (filename, filesize) pairs — metadata only, no content reads.
+    """
+    if fs is None:
+        fs, path = fsspec.core.url_to_fs(path)
+    files = sorted(p for p in fs.find(path, detail=False) if p.endswith(".parquet"))
+    parts = []
+    for f in files:
+        try:
+            size = fs.info(f)["size"]
+        except Exception:
+            size = -1
+        parts.append(f"{os.path.basename(f)}:{size}")
+    return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+
+def get_data_version(processed_path: str = None) -> dict:
+    """Load the processed data manifest and return version metadata dict.
+    Returns empty dict if manifest does not exist.
+    """
+    if processed_path is None:
+        processed_path = config.processed_data_path
+    manifest_path = os.path.join(processed_path, "_manifest.json")
+    fs, fs_path = fsspec.core.url_to_fs(manifest_path)
+    if not fs.exists(fs_path):
+        return {}
+    with fs.open(fs_path, "r") as f:
+        manifest = json.load(f)
+    # Backward compat: old format is a plain list
+    if isinstance(manifest, list):
+        return {"version": 0, "files": manifest, "snapshot_hash": None}
+    return manifest
 
 
 def validate_raw_data(df: dd.DataFrame) -> None:
@@ -136,10 +173,18 @@ def save_processed_data(input_path: str, output_path: str):
     all_files = sorted(
         [p for p in fs.find(fs_path, detail=False) if p.endswith(".parquet")]
     )
+    snapshot_hash = compute_data_hash(output_path, fs=fs)
+    manifest_data = {
+        "version": 1,
+        "snapshot_hash": snapshot_hash,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "file_count": len(all_files),
+        "files": all_files,
+    }
     manifest_path = os.path.join(output_path, "_manifest.json")
-    print(f"Writing manifest for {len(all_files)} files to {manifest_path}...")
+    print(f"Writing manifest for {len(all_files)} files (hash: {snapshot_hash[:8]}...) to {manifest_path}")
     with fs.open(manifest_path, "w") as f:
-        json.dump(all_files, f)
+        json.dump(manifest_data, f, indent=2)
 
     save_summary(output_path)
     print("ETL process complete.")

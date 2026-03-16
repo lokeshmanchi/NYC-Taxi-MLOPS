@@ -27,7 +27,7 @@ from src.features.core import (
     FEATURE_COLS,
     TemporalFeatureEngineer,
 )
-from src.features.transform import load_data, prepare_features
+from src.features.transform import load_data, prepare_features, compute_data_hash, get_data_version
 
 EXPERIMENT_NAME = "nyc-taxi-fare-prediction"
 
@@ -156,6 +156,16 @@ def train(
                     # TemporaryDirectory context manager cleans up both files automatically
             except Exception as e:
                 logger.error(f"❌ Failed to export ONNX model: {e}")
+
+        # Log data provenance — links this run to its exact input data snapshot
+        raw_data_hash = compute_data_hash(data_path)
+        mlflow.set_tag("data_raw_hash", raw_data_hash)
+
+        processed_version = get_data_version()
+        if processed_version.get("snapshot_hash"):
+            mlflow.set_tag("data_processed_hash", processed_version["snapshot_hash"])
+            mlflow.set_tag("data_created_at", processed_version.get("created_at", "unknown"))
+            mlflow.set_tag("data_file_count", str(processed_version.get("file_count", "")))
 
         run_id = run.info.run_id
         logger.info(f"MLflow run_id: {run_id}")

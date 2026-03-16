@@ -52,7 +52,7 @@ graph LR
 *   **Petabyte Scale:**
     *   **Distributed Compute:** The exact same Dask logic runs on a cluster of hundreds of nodes. Dask's scheduler manages task distribution, spilling to disk only when necessary.
     *   **Data Partitioning:** The ETL pipeline now writes **Hive-style partitioned Parquet** (e.g., `/pickup_month=01/`) using Dask's `partition_on` argument. This enables downstream consumers to efficiently read only relevant partitions (predicate pushdown), drastically reducing I/O.
-    *   **Manifest File:** After writing Parquet files, the ETL generates a `_manifest.json` file listing all output files, enabling fast and scalable file discovery for distributed training and avoiding expensive directory listings.
+    *   **Manifest File & Data Versioning:** After writing Parquet files, the ETL generates a versioned `_manifest.json` (v1 dict) containing a `snapshot_hash` (MD5 over sorted `filename:filesize` pairs), `created_at` timestamp, `file_count`, and the `files` list. This enables fast and scalable file discovery (O(1) vs expensive S3 `LIST`), and serves as a content fingerprint so every training run can be traced back to the exact data snapshot that produced it. The `get_data_version()` utility reads this manifest; `compute_data_hash()` can re-fingerprint any directory on demand.
     *   **Storage Abstraction:** By using libraries like `fsspec` and `pyarrow`, the code seamlessly supports both local paths (`data/`) and object storage (`s3://bucket/`).
 
 ### 2.2 Distributed Training
@@ -78,6 +78,7 @@ In a distributed training run involving 500+ nodes, hardware failure is not a po
 
 ### 3.2 Serving Reliability
 *   **Training-Serving Skew:** Skew is eliminated by wrapping feature engineering logic (e.g., `TemporalFeatureEngineer`) into the model pipeline itself. The exact same code transforms data during batch training and real-time inference.
+*   **Data Provenance:** Every MLflow training run is tagged with `data_raw_hash` (fingerprint of the raw input directory) and `data_processed_hash` (fingerprint of the processed Parquet snapshot), plus `data_created_at` and `data_file_count`. If raw files change between runs, the hash changes — making silent data mutations detectable by comparing tags across runs.
 *   **Batch Inference:** The API now provides a `/predict_batch` endpoint for high-throughput scoring of multiple records in a single request, reducing HTTP overhead and supporting production-scale inference.
 *   **Circuit Breakers:** (Planned) API clients should implement retries and circuit breakers to gracefully handle overloads; this is not yet present in the current codebase.
 

@@ -108,16 +108,27 @@ final_df.to_parquet(output_path, partition_on=["pickup_month"], compression="sna
 - If you update the sin/cos formula or add new features, stored data becomes stale and inconsistent with what the model was trained on
 - Instead, derived features are always computed on-the-fly by `TemporalFeatureEngineer` — same code, same result, everywhere
 
-### 4.6 `_manifest.json` — O(1) File Discovery
+### 4.6 `_manifest.json` — O(1) File Discovery + Data Versioning
 
 ```python
-all_files = sorted([p for p in fs.find(fs_path, detail=False) if p.endswith(".parquet")])
-json.dump(all_files, f)
+snapshot_hash = compute_data_hash(output_path, fs=fs)
+manifest_data = {
+    "version": 1,
+    "snapshot_hash": snapshot_hash,       # MD5 over sorted filename:filesize pairs
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "file_count": len(all_files),
+    "files": all_files,
+}
+json.dump(manifest_data, f, indent=2)
 ```
 
-**Problem:** At scale, S3 `list_objects` is slow (100ms+ per 1,000 objects), metered by AWS, and eventually fails when you have millions of partitions.
+**Problem:** At scale, S3 `list_objects` is slow (100ms+ per 1,000 objects), metered by AWS, and eventually fails when you have millions of partitions. Additionally, there was no way to detect if input data changed between training runs — a re-run on mutated data produced different results with no audit trail.
 
-**Solution:** After writing, record all file paths in a JSON manifest. Workers read the manifest once (O(1)) and get the full file list. No cloud listing needed.
+**Solution:** After writing, record all file paths plus a content fingerprint in a versioned manifest dict (v1). Workers read the manifest once (O(1)) and get the full file list and snapshot hash. No cloud listing needed.
+
+**`compute_data_hash(path, fs=None)`:** Walks the directory, sorts `(filename, filesize)` pairs, and returns their MD5 hex digest. Uses filesystem metadata only — no content reads — making it fast even for S3. Given the same files with the same sizes, the hash is always identical.
+
+**`get_data_version(processed_path=None)`:** Loads the manifest and returns the version dict. Handles backward compatibility: if the manifest is a legacy plain list (v0), wraps it as `{"version": 0, "files": [...], "snapshot_hash": None}`.
 
 **Fallback:** If the manifest doesn't exist, workers fall back to `fs.find()` — safe for local development where listing is fast.
 
@@ -169,12 +180,23 @@ pipeline = Pipeline([
     ("model", xgb.XGBRegressor(**params)),
 ])
 mlflow.sklearn.log_model(pipeline, artifact_path="model", registered_model_name="nyc-taxi-regressor")
+
+# Data provenance tags — every run is traceable to its exact input snapshot
+mlflow.set_tag("data_raw_hash", compute_data_hash(data_path))
+mlflow.set_tag("data_processed_hash", processed_version["snapshot_hash"])
+mlflow.set_tag("data_created_at", processed_version["created_at"])
+mlflow.set_tag("data_file_count", str(processed_version["file_count"]))
 ```
 
 **Why bundle the transformer in the pipeline?**
 - The pipeline is the deployable artifact. Loading it gives you a single `.predict(BASE_FEATURE_COLS)` call — the transformer runs automatically before the model
 - Eliminates a whole class of bugs: the transformer code that ran during training is the same object that runs at serving time
 - `mlflow.sklearn.log_model` serializes the full pipeline with `joblib`, so nothing is lost
+
+**Why log data provenance tags?**
+- `data_raw_hash` is an MD5 fingerprint of the raw input directory (computed via `compute_data_hash`). If two runs have different `data_raw_hash` values, the raw input files changed between runs — making silent data mutations detectable.
+- `data_processed_hash` fingerprints the post-ETL Parquet snapshot. This catches cases where ETL logic changed even if raw data didn't.
+- Together they form a full audit trail: raw data → ETL → model, all in one MLflow run's Tags tab.
 
 **Why XGBoost for this problem?**
 - NYC taxi fare is a tabular regression problem. Tree-based models (XGBoost, LightGBM) consistently outperform neural networks on tabular data with <1M rows because they don't need to learn feature interactions from scratch — each split explicitly encodes one
@@ -244,6 +266,8 @@ class ParquetStreamingDataset(IterableDataset):
 self.my_files = all_files[rank::world_size]
 ```
 Each GPU (rank) processes a different non-overlapping slice of files. With 4 GPUs: GPU 0 gets files 0,4,8…; GPU 1 gets files 1,5,9… etc. No coordination needed — each worker knows its slice statically.
+
+**Manifest backward compatibility:** The manifest reader handles both the new v1 dict format (`{"version": 1, "files": [...], "snapshot_hash": "..."}`) and the legacy v0 plain list format. When reading a v1 manifest, rank 0 prints the snapshot hash prefix for log traceability.
 
 **Why `use_listings_cache=False`?** Long-running training jobs can run for hours. S3 metadata caches go stale; with `False`, each worker creates a fresh filesystem connection, preventing stale-cache errors.
 
