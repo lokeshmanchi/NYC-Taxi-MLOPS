@@ -80,16 +80,19 @@
       "gridPos": { "x": 18, "y": 8, "w": 6, "h": 8 },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{handler=\"/health\", status_code=\"200\"}[1m]))",
-          "legendFormat": "Health checks/s"
+          "expr": "model_loaded_bool",
+          "legendFormat": "Model loaded"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "reqps", "color": { "mode": "thresholds" },
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" },
           "thresholds": { "steps": [
             { "color": "red", "value": null },
-            { "color": "green", "value": 0.01 }
-          ]}
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NOT LOADED" }, "1": { "text": "LOADED" } } }
+          ]
         }
       }
     }

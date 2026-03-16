@@ -2,6 +2,7 @@
 
 import os
 import json
+import warnings
 from typing import Tuple
 
 import fsspec
@@ -10,6 +11,40 @@ import dask.dataframe as dd
 from src.config import config
 from src.features.core import BASE_FEATURE_COLS, TARGET_COL
 from src.features.summarize import save_summary
+
+# Columns that must be present in the raw parquet before ETL runs.
+REQUIRED_RAW_COLS = [
+    "lpep_pickup_datetime",
+    "fare_amount",
+    "trip_distance",
+    "passenger_count",
+    "PULocationID",
+    "DOLocationID",
+    "RatecodeID",
+]
+
+
+def validate_raw_data(df: dd.DataFrame) -> None:
+    """
+    Lightweight pre-flight schema check before ETL runs.
+
+    Checks column presence (metadata-only, free) then samples the first
+    partition to catch catastrophic null rates early. Raises ValueError on
+    missing columns; emits a warning on >50% nulls in any column.
+    """
+    missing = [c for c in REQUIRED_RAW_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"ETL aborted — missing required columns: {missing}")
+
+    sample = df[REQUIRED_RAW_COLS].head(1000)  # reads first partition only
+    null_rates = sample.isnull().mean()
+    critical = null_rates[null_rates > 0.5]
+    if not critical.empty:
+        warnings.warn(
+            f"High null rates detected in sample (>50%): {critical.to_dict()}. "
+            "Check source data quality before proceeding.",
+            stacklevel=2,
+        )
 
 
 def load_data(data_path: str = "data") -> dd.DataFrame:
@@ -72,6 +107,7 @@ def save_processed_data(input_path: str, output_path: str):
     """
     print(f"Processing data from {input_path}...")
     df = load_data(input_path)
+    validate_raw_data(df)
 
     # Apply filters and base feature engineering.
     # Derived features (sin/cos, is_weekend) are NOT saved. They are generated
