@@ -54,3 +54,15 @@ While the documentation highlights cloud scalability, the architecture is design
 - **Edge Robotic Systems:** This pipeline can be containerized and deployed to edge robotic systems using the same Docker/Kubernetes logic used in the cloud.
 - **Storage Independence:** The codebase utilizes `fsspec` (in `transform.py` and `app.py`), allowing seamless switching between cloud storage (S3/GCS) and local on-premise storage (MinIO, NFS) without code changes.
 - **Low-Latency Inference:** For resource-constrained edge devices, the architecture supports exporting models to ONNX (Open Neural Network Exchange) to run on specialized hardware accelerators.
+
+## Production Hardening and Scalability Enhancements
+
+The following improvements are now implemented in code to target petabyte scale and edge readiness:
+
+- DDP backend is configurable via `DDP_BACKEND` and falls back from `nccl` to `gloo` when needed.
+- ETL writes a `_manifest.json` with `.parquet` file paths to avoid expensive list operations at scale.
+- PyTorch training is configurable via env vars: `EPOCHS`, `BATCH_SIZE`, `NUM_WORKERS`, `GRAD_ACCUMULATION_STEPS`, `LOG_STEP_INTERVAL`.
+- Training includes checkpoint resume, local step-based MLflow metric logging, and CPU/GPU warmup paths.
+- Serving has a `MAX_BATCH_SIZE` guard, warmup modeling, and ONNX/sklearn fallback behavior.
+- Prefect flow now supports `NPROC_PER_NODE`, `RDZV_ENDPOINT`, and can run on multi-node clusters.
+

@@ -34,10 +34,16 @@ def run_etl(input_path: str, output_path: str):
 @task(name="Launch Distributed Training")
 def run_training(processed_data_path: str):
     """Prefect task to launch the PyTorch DDP training script."""
-    command = "torchrun --standalone --nproc_per_node=2 src/training/train_pytorch_ddp.py"
+    nproc = os.getenv("NPROC_PER_NODE", "2")
+    rdzv_endpoint = os.getenv("RDZV_ENDPOINT")
+    rdzv_id = os.getenv("RDZV_ID", "ddp_run")
+    rdzv_args = ""
+
+    if rdzv_endpoint:
+        rdzv_args = f" --rdzv_id {rdzv_id} --rdzv_backend c10d --rdzv_endpoint {rdzv_endpoint}"
+
+    command = f"torchrun --standalone --nproc_per_node={nproc}{rdzv_args} " "src/training/train_pytorch_ddp.py"
     print(f"Executing command: {command}")
-    # Use subprocess.run for better error handling.
-    # If the script fails (non-zero exit code), it will raise an exception.
     subprocess.run(command, shell=True, check=True)
 
 
@@ -45,9 +51,7 @@ def run_training(processed_data_path: str):
 def etl_and_train_flow():
     """Main flow to run ETL and then launch the training job."""
     etl_output_path = os.getenv("PROCESSED_DATA_PATH", "data/processed")
-    run_etl(
-        input_path=os.getenv("DATA_PATH", "data"), output_path=etl_output_path
-    )
+    run_etl(input_path=os.getenv("DATA_PATH", "data"), output_path=etl_output_path)
     run_training(processed_data_path=etl_output_path)
 
 

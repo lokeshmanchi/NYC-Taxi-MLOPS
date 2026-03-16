@@ -30,13 +30,28 @@ from src.features.transform import (
 
 def setup_ddp():
     """Initializes the distributed environment from environment variables."""
-    dist.init_process_group(backend="nccl")  # "nccl" for GPU, "gloo" for CPU
+    backend = os.getenv("DDP_BACKEND", "nccl")
+    try:
+        dist.init_process_group(backend=backend)
+    except Exception as e:
+        if backend == "nccl":
+            print("Warning: NCCL init failed, falling back to gloo (CPU or mixed).", e)
+            dist.init_process_group(backend="gloo")
+            backend = "gloo"
+        else:
+            raise
+
     # `torchrun` sets RANK, LOCAL_RANK, and WORLD_SIZE env vars.
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    print(f"Start DDP rank {rank} (local {local_rank}) of {world_size}.")
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+
+    # Set GPU device only when using GPU backend.
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+        torch.backends.cudnn.benchmark = True
+
+    print(f"Start DDP rank {rank} (local {local_rank}) of {world_size}, backend={backend}.")
     return rank, local_rank, world_size
 
 
@@ -85,9 +100,14 @@ class ParquetStreamingDataset(IterableDataset):
         # Read the manifest to get a list of all data partitions.
         # Avoids expensive listing on object storage.
         manifest_path = os.path.join(self.data_path, "_manifest.json")
-        fs, _ = fsspec.core.url_to_fs(manifest_path)
-        with fs.open(manifest_path, "r") as f:
-            all_files = json.load(f)
+        fs, fs_path = fsspec.core.url_to_fs(manifest_path)
+
+        if fs.exists(fs_path):
+            with fs.open(manifest_path, "r") as f:
+                all_files = json.load(f)
+        else:
+            print(f"Manifest file not found at {manifest_path}, using fs.find() fallback.")
+            all_files = sorted(fs.find(self.data_path, detail=False))
 
         # DDP Sharding: Assign subset of files to this GPU (rank).
         self.my_files = all_files[rank::world_size]
@@ -106,9 +126,7 @@ class ParquetStreamingDataset(IterableDataset):
             # Use pyarrow to stream batches with column projection.
             fs = fsspec.core.url_to_fs(file_path)[0]
             parquet_file = pq.ParquetFile(file_path, filesystem=fs)
-            iter_b = parquet_file.iter_batches(
-                batch_size=self.batch_size, columns=self.columns
-            )
+            iter_b = parquet_file.iter_batches(batch_size=self.batch_size, columns=self.columns)
             for batch in iter_b:
                 df_raw = batch.to_pandas()
 
@@ -133,9 +151,9 @@ def run_training(data_path: str, model_output_path: str):
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4096"))
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
     GRAD_ACCUMULATION_STEPS = int(os.getenv("GRAD_ACCUMULATION_STEPS", "4"))
-    MLFLOW_TRACKING_URI = os.getenv(
-        "MLFLOW_TRACKING_URI", "http://localhost:5000"
-    )
+    EPOCHS = int(os.getenv("EPOCHS", "5"))
+    LOG_STEP_INTERVAL = int(os.getenv("LOG_STEP_INTERVAL", "100"))
+    MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
     EXPERIMENT_NAME = "nyc-taxi-fare-prediction-ddp"
 
     rank, local_rank, world_size = setup_ddp()
@@ -143,9 +161,7 @@ def run_training(data_path: str, model_output_path: str):
     try:
         # 1. DATA PREPARATION
         # Initialize the streaming dataset. No data is loaded into RAM yet.
-        dataset = ParquetStreamingDataset(
-            data_path, rank=rank, world_size=world_size, batch_size=BATCH_SIZE
-        )
+        dataset = ParquetStreamingDataset(data_path, rank=rank, world_size=world_size, batch_size=BATCH_SIZE)
 
         # Set up MLflow tracking only on the master process
         if rank == 0:
@@ -162,9 +178,7 @@ def run_training(data_path: str, model_output_path: str):
             mlflow.log_params(params)
 
         # batch_size=None because the Dataset yields pre-batched tensors.
-        dataloader = DataLoader(
-            dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=True
-        )
+        dataloader = DataLoader(dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=True)
 
         # 2. MODEL INITIALIZATION
         # The model is created on the CPU, then moved to its assigned GPU.
@@ -203,29 +217,36 @@ def run_training(data_path: str, model_output_path: str):
             start_epoch = checkpoint["epoch"] + 1
 
         # 3. TRAINING LOOP
-        for epoch in range(start_epoch, 5):
+        global_step = 0
+        for epoch in range(start_epoch, EPOCHS):
             # Set model to training mode
             ddp_model.train()
+            epoch_loss = 0.0
             for i, (inputs, targets) in enumerate(dataloader):
                 inputs = inputs.to(local_rank)
                 targets = targets.to(local_rank)
 
                 outputs = ddp_model(inputs)
                 loss = criterion(outputs, targets)
+                epoch_loss += loss.item()
 
                 # Scale the loss for gradient accumulation
                 loss = loss / GRAD_ACCUMULATION_STEPS
-                loss.backward()  # Gradients are computed on each GPU.
+                loss.backward()
 
                 if (i + 1) % GRAD_ACCUMULATION_STEPS == 0:
-                    optimizer.step()  # Update weights
-                    optimizer.zero_grad()  # Reset gradients
-            # Log loss from the master process only to avoid spamming logs.
-            epoch_loss = loss.item() * GRAD_ACCUMULATION_STEPS
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                global_step += 1
+                if rank == 0 and global_step % LOG_STEP_INTERVAL == 0:
+                    mlflow.log_metric("step_loss", loss.item() * GRAD_ACCUMULATION_STEPS, step=global_step)
+
+            # Log epoch metrics from the master process only.
             if rank == 0:
-                print(f"Epoch {epoch+1}, Loss: {epoch_loss:.4f}")
-                # Log metrics to MLflow
-                mlflow.log_metric("loss", epoch_loss, step=epoch)
+                avg_epoch_loss = epoch_loss / max(1, len(dataloader))
+                print(f"Epoch {epoch+1}, Avg Loss: {avg_epoch_loss:.4f}")
+                mlflow.log_metric("loss", avg_epoch_loss, step=epoch)
 
                 # Save checkpoint at the end of every epoch
                 print(f"Saving checkpoint to {checkpoint_path}")

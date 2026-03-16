@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nyc-taxi-api")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/model.pkl")
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "256"))
 
 model = None
 inference_mode = "sklearn"  # Options: 'sklearn' or 'onnx'
@@ -39,10 +40,7 @@ async def lifespan(app: FastAPI):
         # 1. Fault Tolerant Loading: Check for ONNX first (High Performance / Edge)
         if MODEL_PATH.endswith(".onnx"):
             if ort is None:
-                logger.warning(
-                    "ONNX model found but `onnxruntime` is missing. "
-                    "Install it to use fast inference."
-                )
+                logger.warning("ONNX model found but `onnxruntime` is missing. " "Install it to use fast inference.")
             else:
                 logger.info(f"Loading ONNX model from {MODEL_PATH}...")
                 # Load bytes using fsspec (supports s3://, gs://, local)
@@ -77,6 +75,41 @@ app = FastAPI(
 )
 
 
+def warmup_model():
+    """Run one sample inference to warm up latency-critical pathways."""
+    global model, inference_mode
+    if model is None:
+        return
+
+    sample = pd.DataFrame(
+        [
+            {
+                "trip_distance": 1.0,
+                "passenger_count": 1,
+                "PULocationID": 1,
+                "DOLocationID": 1,
+                "pickup_hour": 12,
+                "pickup_dayofweek": 2,
+                "pickup_month": 1,
+                "RatecodeID": 1,
+            }
+        ]
+    )
+
+    try:
+        if inference_mode == "onnx":
+            x = feature_engineer.transform(sample)
+            x = x[FEATURE_COLS].astype("float32").to_numpy()
+            input_name = model.get_inputs()[0].name
+            label_name = model.get_outputs()[0].name
+            _ = model.run([label_name], {input_name: x})
+        else:
+            model.predict(sample)
+        logger.info("Warmup inference completed.")
+    except Exception as e:
+        logger.warning(f"Warmup failed: {e}")
+
+
 @app.get("/health")
 async def health():
     return {
@@ -89,22 +122,14 @@ async def health():
 class TripFeatures(BaseModel):
     trip_distance: float = Field(..., gt=0, example=2.5, description="Miles")
     passenger_count: int = Field(..., ge=1, le=6, example=1)
-    PULocationID: int = Field(
-        ..., example=236, description="TLC pickup zone ID"
-    )
-    DOLocationID: int = Field(
-        ..., example=237, description="TLC dropoff zone ID"
-    )
+    PULocationID: int = Field(..., example=236, description="TLC pickup zone ID")
+    DOLocationID: int = Field(..., example=237, description="TLC dropoff zone ID")
     # Note: is_weekend is no longer needed. The model pipeline will generate it
     # from the raw features below.
     pickup_hour: int = Field(..., ge=0, le=23, example=14)
-    pickup_dayofweek: int = Field(
-        ..., ge=0, le=6, example=2, description="0=Monday, 6=Sunday"
-    )
+    pickup_dayofweek: int = Field(..., ge=0, le=6, example=2, description="0=Monday, 6=Sunday")
     pickup_month: int = Field(..., ge=1, le=12, example=3)
-    RatecodeID: int = Field(
-        1, ge=1, le=6, example=1, description="1=Standard, 2=JFK, 3=Newark"
-    )
+    RatecodeID: int = Field(1, ge=1, le=6, example=1, description="1=Standard, 2=JFK, 3=Newark")
 
 
 class PredictionResponse(BaseModel):
@@ -120,9 +145,7 @@ class BatchPredictionResponse(BaseModel):
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(features: TripFeatures):
     if model is None:
-        raise HTTPException(
-            status_code=503, detail="Model not loaded. Run training first."
-        )
+        raise HTTPException(status_code=503, detail="Model not loaded. Run training first.")
 
     # Create a DataFrame from the input features. The column names must match
     # what the training pipeline expects.
@@ -137,9 +160,7 @@ async def predict(features: TripFeatures):
         # 3. Run inference
         input_name = model.get_inputs()[0].name
         label_name = model.get_outputs()[0].name
-        predicted_fare = float(
-            model.run([label_name], {input_name: inputs})[0][0]
-        )
+        predicted_fare = float(model.run([label_name], {input_name: inputs})[0][0])
     else:
         # Sklearn Approach: Pipeline handles everything
         predicted_fare = float(model.predict(feature_df)[0])
@@ -153,12 +174,16 @@ async def predict(features: TripFeatures):
 @app.post("/predict_batch", response_model=BatchPredictionResponse)
 async def predict_batch(features_list: List[TripFeatures]):
     if model is None:
-        raise HTTPException(
-            status_code=503, detail="Model not loaded. Run training first."
-        )
+        raise HTTPException(status_code=503, detail="Model not loaded. Run training first.")
 
     if not features_list:
         return BatchPredictionResponse(predictions=[])
+
+    if len(features_list) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE}).",
+        )
 
     # Create a DataFrame from the list of input features
     feature_df = pd.DataFrame([f.dict() for f in features_list])

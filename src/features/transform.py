@@ -37,9 +37,7 @@ def load_data(data_path: str = "data") -> dd.DataFrame:
         # dd.read_parquet reads the data lazily, creating a task graph.
         return dd.read_parquet(data_path)
     except Exception as e:
-        raise FileNotFoundError(
-            f"Could not create Dask DataFrame from {data_path}: {e}"
-        )
+        raise FileNotFoundError(f"Could not create Dask DataFrame from {data_path}: {e}")
 
 
 class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
@@ -47,6 +45,7 @@ class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
     Scikit-learn compatible transformer to generate temporal features.
     Ensures identical logic is applied during Training and Serving.
     """
+
     def fit(self, X, y=None):
         return self
 
@@ -115,9 +114,7 @@ def save_processed_data(input_path: str, output_path: str):
 
     final_df = df[BASE_FEATURE_COLS + [TARGET_COL]]
 
-    print(
-        f"Saving processed data to {output_path} with Hive partitioning..."
-    )
+    print(f"Saving processed data to {output_path} with Hive partitioning...")
     # By partitioning on a column like `pickup_month`, we enable downstream
     # consumers to perform "predicate pushdown", reading only the data
     # they need. This is a critical optimization for petabyte-scale lakes.
@@ -132,7 +129,7 @@ def save_processed_data(input_path: str, output_path: str):
     # This is critical for datasets with millions of partitions.
     fs, fs_path = fsspec.core.url_to_fs(output_path)
     # Use `fs.find` to recursively list all created parquet files.
-    all_files = sorted(fs.find(fs_path, detail=False))
+    all_files = sorted([p for p in fs.find(fs_path, detail=False) if p.endswith(".parquet")])
     manifest_path = os.path.join(output_path, "_manifest.json")
     print(f"Writing manifest for {len(all_files)} files to {manifest_path}...")
     with fs.open(manifest_path, "w") as f:
