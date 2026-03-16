@@ -33,20 +33,24 @@ def run_etl(input_path: str, output_path: str):
 
 
 @task(name="Launch Distributed Training")
-def run_training(processed_data_path: str):
+def run_training():
     """Prefect task to launch the PyTorch DDP training script."""
     nproc = config.nproc_per_node
     rdzv_endpoint = config.rdzv_endpoint
     rdzv_id = config.rdzv_id
-    rdzv_args = ""
 
     if rdzv_endpoint:
-        rdzv_args = (
-            f" --rdzv_id {rdzv_id} --rdzv_backend c10d "
-            f"--rdzv_endpoint {rdzv_endpoint}"
+        # Multi-node: explicit rendezvous — do NOT use --standalone (mutually exclusive)
+        command = (
+            f"torchrun --nproc_per_node={nproc}"
+            f" --rdzv_id {rdzv_id} --rdzv_backend c10d"
+            f" --rdzv_endpoint {rdzv_endpoint}"
+            f" src/training/train_pytorch_ddp.py"
         )
+    else:
+        # Single-node: --standalone handles rendezvous automatically
+        command = f"torchrun --standalone --nproc_per_node={nproc} src/training/train_pytorch_ddp.py"
 
-    command = f"torchrun --standalone --nproc_per_node={nproc}{rdzv_args} src/training/train_pytorch_ddp.py"  # noqa: E501
     print(f"Executing command: {command}")
     subprocess.run(command, shell=True, check=True)
 
@@ -56,7 +60,7 @@ def etl_and_train_flow():
     """Main flow to run ETL and then launch the training job."""
     etl_output_path = config.processed_data_path
     run_etl(input_path=config.data_path, output_path=etl_output_path)
-    run_training(processed_data_path=etl_output_path)
+    run_training()
 
 
 if __name__ == "__main__":

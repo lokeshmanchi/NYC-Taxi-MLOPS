@@ -18,12 +18,14 @@ def test_temporal_feature_engineer():
     
     # Assertions
     assert "hour_sin" in res.columns
+    assert "hour_cos" in res.columns
     assert "is_weekend" in res.columns
     assert res.iloc[0]["is_weekend"] == 0  # Monday
     assert res.iloc[1]["is_weekend"] == 1  # Saturday
-    
-    # Check cyclic feature correctness: sin(0) should be 0
+
+    # Check cyclic feature correctness: hour=0 → sin=0, cos=1
     assert np.isclose(res.iloc[0]["hour_sin"], 0.0)
+    assert np.isclose(res.iloc[0]["hour_cos"], 1.0)
 
 
 def test_filter_outliers_dask():

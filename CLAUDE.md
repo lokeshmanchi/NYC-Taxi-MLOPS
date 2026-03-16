@@ -14,6 +14,8 @@ MLOps pipeline for NYC Green Taxi fare prediction (Jan–May 2025, `data/`). Tra
 | Pipeline orchestration | Prefect 3 | http://localhost:4200 |
 | Model serving | FastAPI + Uvicorn | http://localhost:8000 |
 | Visualization dashboard | Streamlit | http://localhost:8501 |
+| Metrics scraping | Prometheus | http://localhost:9090 |
+| Observability dashboard | Grafana | http://localhost:3000 (admin/admin) |
 
 ## Common Commands
 

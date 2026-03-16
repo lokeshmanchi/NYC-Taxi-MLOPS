@@ -9,6 +9,7 @@ import dask.dataframe as dd
 
 from src.config import config
 from src.features.core import BASE_FEATURE_COLS, TARGET_COL
+from src.features.summarize import save_summary
 
 
 def load_data(data_path: str = "data") -> dd.DataFrame:
@@ -43,12 +44,14 @@ def filter_outliers(df: dd.DataFrame) -> dd.DataFrame:
 def engineer_features(df: dd.DataFrame) -> dd.DataFrame:
     # With Dask, these operations build up the task graph.
     # No computation happens yet.
-    df["lpep_pickup_datetime"] = dd.to_datetime(df["lpep_pickup_datetime"])
-    df["pickup_hour"] = df["lpep_pickup_datetime"].dt.hour
-    df["pickup_dayofweek"] = df["lpep_pickup_datetime"].dt.dayofweek
-    df["pickup_month"] = df["lpep_pickup_datetime"].dt.month
-    df["RatecodeID"] = df["RatecodeID"].fillna(1).astype(int)
-    df["passenger_count"] = df["passenger_count"].fillna(1).astype(int)
+    dt = dd.to_datetime(df["lpep_pickup_datetime"])
+    df = df.assign(
+        pickup_hour=dt.dt.hour,
+        pickup_dayofweek=dt.dt.dayofweek,
+        pickup_month=dt.dt.month,
+        RatecodeID=df["RatecodeID"].fillna(1).astype(int),
+        passenger_count=df["passenger_count"].fillna(1).astype(int),
+    )
     return df
 
 
@@ -102,6 +105,7 @@ def save_processed_data(input_path: str, output_path: str):
     with fs.open(manifest_path, "w") as f:
         json.dump(all_files, f)
 
+    save_summary(output_path)
     print("ETL process complete.")
 
 

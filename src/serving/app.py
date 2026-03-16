@@ -3,16 +3,22 @@
 import logging
 from typing import List
 from contextlib import asynccontextmanager
+from datetime import date
 
 import fsspec
 import joblib
+import pyarrow as pa
+import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 import pandas as pd
 from pydantic import BaseModel, Field
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # Import feature logic for the Hybrid ONNX approach
 from src.config import config
 from src.features.core import TemporalFeatureEngineer, FEATURE_COLS
+from src.monitoring.drift import generate_drift_report
 
 # Try importing ONNX Runtime for edge inference
 try:
@@ -62,10 +68,11 @@ async def lifespan(app: FastAPI):
             inference_mode = "sklearn"
             logger.info(f"✅ Loaded Sklearn pipeline (Mode: {inference_mode})")
 
-    except (FileNotFoundError, Exception) as e:
+    except Exception as e:
         logger.error(f"❌ Critical Error: Load failed {MODEL_PATH}: {e}")
         logger.info("Tip: Run `make train` or update MODEL_PATH env var.")
 
+    warmup_model()
     yield
     # Cleanup code can go here if needed
 
@@ -77,10 +84,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+Instrumentator().instrument(app).expose(app)
+
+PREDICTION_LOG_PATH = "data/predictions"
+
+
+def _log_prediction(features: dict, predicted_fare: float):
+    """Append one prediction row to a date-partitioned Parquet dataset."""
+    row = {**features, "predicted_fare": predicted_fare, "log_date": str(date.today())}
+    table = pa.Table.from_pydict({k: [v] for k, v in row.items()})
+    pq.write_to_dataset(table, root_path=PREDICTION_LOG_PATH, partition_cols=["log_date"])
+
 
 def warmup_model():
     """Run one sample inference to warm up latency-critical pathways."""
-    global model, inference_mode
     if model is None:
         return
 
@@ -122,6 +139,20 @@ async def health():
     }
 
 
+@app.get("/monitoring/drift", response_class=HTMLResponse)
+async def drift_report():
+    """Generate and return an Evidently data drift report as HTML."""
+    try:
+        report_path = generate_drift_report()
+        with open(report_path, "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Drift report generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Drift report failed: {e}")
+
+
 class TripFeatures(BaseModel):
     trip_distance: float = Field(..., gt=0, example=2.5, description="Miles")
     passenger_count: int = Field(..., ge=1, le=6, example=1)
@@ -156,7 +187,7 @@ async def predict(features: TripFeatures):
 
     # Create a DataFrame from the input features. The column names must match
     # what the training pipeline expects.
-    feature_df = pd.DataFrame([features.dict()])
+    feature_df = pd.DataFrame([features.model_dump()])
 
     if inference_mode == "onnx":
         # Hybrid Approach: Python Feature Eng -> ONNX Inference
@@ -176,6 +207,11 @@ async def predict(features: TripFeatures):
     # Enforce business rule (minimum fare)
     predicted_fare = max(2.5, round(predicted_fare, 2))
 
+    try:
+        _log_prediction(features.model_dump(), predicted_fare)
+    except Exception as e:
+        logger.warning(f"Prediction logging failed: {e}")
+
     return PredictionResponse(predicted_fare=predicted_fare)
 
 
@@ -194,7 +230,7 @@ async def predict_batch(features_list: List[TripFeatures]):
         )
 
     # Create a DataFrame from the list of input features
-    feature_df = pd.DataFrame([f.dict() for f in features_list])
+    feature_df = pd.DataFrame([f.model_dump() for f in features_list])
 
     if inference_mode == "onnx":
         # Hybrid Batch Inference
@@ -211,5 +247,11 @@ async def predict_batch(features_list: List[TripFeatures]):
 
     # Apply business rule to each prediction
     processed_fares = [max(2.5, round(fare, 2)) for fare in predicted_fares]
+
+    try:
+        for feat, fare in zip(features_list, processed_fares):
+            _log_prediction(feat.model_dump(), fare)
+    except Exception as e:
+        logger.warning(f"Batch prediction logging failed: {e}")
 
     return BatchPredictionResponse(predictions=processed_fares)

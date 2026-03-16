@@ -9,6 +9,7 @@ torchrun --standalone --nproc_per_node=4 src/training/train_pytorch_ddp.py
 """
 
 import os
+import time
 
 import fsspec
 import json
@@ -112,7 +113,7 @@ class ParquetStreamingDataset(IterableDataset):
                 all_files = json.load(f)
         else:
             print(f"Manifest file not found at {manifest_path}, using fs.find() fallback.")
-            all_files = sorted(fs.find(self.data_path, detail=False))
+            all_files = sorted(p for p in fs.find(self.data_path, detail=False) if p.endswith(".parquet"))
 
         # DDP Sharding: Assign subset of files to this GPU (rank).
         self.my_files = all_files[rank::world_size]
@@ -166,6 +167,8 @@ def run_training(data_path: str, model_output_path: str):
     EXPERIMENT_NAME = config.experiment_name + "-ddp"
 
     rank, local_rank, world_size = setup_ddp()
+    # Resolve the correct device once — CUDA for nccl, CPU for gloo
+    device = f"cuda:{local_rank}" if dist.get_backend() == "nccl" else "cpu"
 
     try:
         # 1. DATA PREPARATION
@@ -187,27 +190,34 @@ def run_training(data_path: str, model_output_path: str):
             mlflow.log_params(params)
 
         # batch_size=None because the Dataset yields pre-batched tensors.
-        dataloader = DataLoader(dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=True)
+        dataloader = DataLoader(
+            dataset, batch_size=None, num_workers=NUM_WORKERS, pin_memory=(dist.get_backend() == "nccl")
+        )
 
         # 2. MODEL INITIALIZATION
         # The model is created on the CPU, then moved to its assigned GPU.
-        model = TabularNet(num_features=len(FEATURE_COLS)).to(local_rank)
+        model = TabularNet(num_features=len(FEATURE_COLS)).to(device)
 
         # "Identify and remediate bottlenecks... optimize throughput"
         # Using torch.compile (PyTorch 2.0+) fuses layers and optimizes CUDA
         # kernels for the GPU architecture (e.g., A100/H100).
         # We compile BEFORE wrapping in DDP.
-        print("Compiling model with torch.compile for higher throughput...")
-        model = torch.compile(model)
+        if hasattr(torch, "compile"):
+            print("Compiling model with torch.compile for higher throughput...")
+            model = torch.compile(model)
+        else:
+            print("torch.compile not available (requires PyTorch 2.0+), skipping.")
 
         # DDP wraps the model and handles gradient synchronization across all GPUs.
         # From now on, you only use `ddp_model`.
-        ddp_model = DDP(model, device_ids=[local_rank])
+        # device_ids is only valid for CUDA DDP — pass None for gloo/CPU
+        device_ids = [local_rank] if dist.get_backend() == "nccl" else None
+        ddp_model = DDP(model, device_ids=device_ids)
 
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(ddp_model.parameters(), lr=0.001)
         # Initialize GradScaler for Mixed Precision (AMP) training
-        scaler = GradScaler(enabled=(config.ddp_backend == "nccl"))
+        scaler = GradScaler(enabled=(dist.get_backend() == "nccl"))
 
         # 2.1 ELASTIC CHECKPOINTING
         # Load from S3/local checkpoint if it exists to recover from failures
@@ -221,8 +231,7 @@ def run_training(data_path: str, model_output_path: str):
                 print(f"Resuming from checkpoint: {checkpoint_path}")
             # Open stream with fsspec to support S3
             with fs.open(cp_fs_path, "rb") as f:
-                # map_location is crucial for DDP to load onto correct device
-                checkpoint = torch.load(f, map_location=f"cuda:{local_rank}")
+                checkpoint = torch.load(f, map_location=device)
             ddp_model.module.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             # Load scaler state if available (crucial for resuming AMP training)
@@ -236,15 +245,23 @@ def run_training(data_path: str, model_output_path: str):
             # Set model to training mode
             ddp_model.train()
             epoch_loss = 0.0
+            epoch_samples = 0
+            epoch_start = time.perf_counter()
+
+            # Reset peak GPU memory counter at the start of each epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(local_rank)
+
             for i, (inputs, targets) in enumerate(dataloader):
-                inputs = inputs.to(local_rank)
-                targets = targets.to(local_rank)
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                epoch_samples += inputs.shape[0]
 
                 # Mixed Precision Context
                 with torch.amp.autocast(
                     device_type="cuda",
                     dtype=torch.float16,
-                    enabled=(config.ddp_backend == "nccl")
+                    enabled=(dist.get_backend() == "nccl")
                 ):
                     outputs = ddp_model(inputs)
                     loss = criterion(outputs, targets)
@@ -267,9 +284,32 @@ def run_training(data_path: str, model_output_path: str):
 
             # Log epoch metrics from the master process only.
             if rank == 0:
+                epoch_elapsed = time.perf_counter() - epoch_start
+                samples_per_sec = epoch_samples / epoch_elapsed if epoch_elapsed > 0 else 0
                 avg_epoch_loss = epoch_loss / max(1, len(dataloader))
-                print(f"Epoch {epoch+1}, Avg Loss: {avg_epoch_loss:.4f}")
-                mlflow.log_metric("loss", avg_epoch_loss, step=epoch)
+
+                # GPU memory (peak allocated this epoch, in GiB)
+                peak_mem_gib = 0.0
+                gpu_util_pct = 0.0
+                if torch.cuda.is_available():
+                    peak_mem_gib = torch.cuda.max_memory_allocated(local_rank) / 1024 ** 3
+                    try:
+                        gpu_util_pct = float(torch.cuda.utilization(local_rank))
+                    except Exception:
+                        pass  # torch.cuda.utilization not available on all builds
+
+                print(
+                    f"Epoch {epoch+1}/{EPOCHS} | loss={avg_epoch_loss:.4f} | "
+                    f"samples/s={samples_per_sec:,.0f} | "
+                    f"peak_mem={peak_mem_gib:.2f}GiB | gpu_util={gpu_util_pct:.0f}%"
+                )
+                mlflow.log_metrics({
+                    "loss": avg_epoch_loss,
+                    "samples_per_sec": samples_per_sec,
+                    "peak_gpu_mem_gib": peak_mem_gib,
+                    "gpu_util_pct": gpu_util_pct,
+                    "epoch_time_s": epoch_elapsed,
+                }, step=epoch)
 
                 # Save checkpoint at the end of every epoch
                 print(f"Saving checkpoint to {checkpoint_path}")
@@ -285,6 +325,10 @@ def run_training(data_path: str, model_output_path: str):
         # 4. SAVE MODEL
         # Only the master process (rank 0) should save the model to prevent race conditions.
         if rank == 0:
+            mlflow.log_params({
+                "total_epochs_trained": EPOCHS - start_epoch,
+                "world_size": world_size,
+            })
             # When saving a DDP model, you save the underlying `module`'s state_dict.
             # Log the final model to MLflow
             mlflow.pytorch.log_model(
@@ -293,6 +337,31 @@ def run_training(data_path: str, model_output_path: str):
                 registered_model_name="nyc-taxi-regressor-ddp",
             )
             print(f"Model saved to {model_output_path}")
+
+            # 5. ONNX EXPORT — closes the DDP → edge_run.py deployment loop.
+            # Export the underlying module (not the DDP wrapper) with a dynamic batch axis
+            # so edge_run.py can run single-sample or micro-batch inference.
+            try:
+                print("Exporting TabularNet to ONNX for edge deployment...")
+                onnx_path = model_output_path.replace(".pt", ".onnx")
+                dummy_input = torch.zeros(1, len(FEATURE_COLS), dtype=torch.float32)
+                torch.onnx.export(
+                    ddp_model.module.to("cpu"),
+                    dummy_input,
+                    onnx_path,
+                    input_names=["features"],
+                    output_names=["fare"],
+                    dynamic_axes={
+                        "features": {0: "batch_size"},
+                        "fare": {0: "batch_size"},
+                    },
+                    opset_version=17,
+                )
+                mlflow.log_artifact(onnx_path, artifact_path="onnx")
+                print(f"ONNX model saved to {onnx_path} and logged to MLflow.")
+            except Exception as e:
+                print(f"ONNX export failed (non-fatal): {e}")
+
             mlflow.end_run()
 
     finally:

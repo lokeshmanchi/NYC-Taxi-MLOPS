@@ -1,6 +1,7 @@
 from typing import Optional
 
 from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 
 
 class AppConfig(BaseSettings):
@@ -38,10 +39,11 @@ class AppConfig(BaseSettings):
     # API / UI
     api_url: str = "http://localhost:8000"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
 
 
 config = AppConfig()

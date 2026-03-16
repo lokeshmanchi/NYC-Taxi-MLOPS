@@ -100,21 +100,69 @@ In a distributed training run involving 500+ nodes, hardware failure is not a po
 | **Metadata Overhead** (Listing millions of files) | Manifest Files | Use a catalog (e.g., Hive Metastore) or manifest files instead of `glob` listing S3 buckets directly. |
 | **Compute Bound** (GPU underutilization) | JIT Compilation | `torch.compile` optimizes kernel fusion to maximize FLOPs utilization on modern GPUs. |
 
+## 5. Multimodal Data Ingestion
+
+The same infrastructure patterns that handle NYC taxi tabular data scale directly to multimodal sensor streams from robotic platforms (cameras, LiDAR, IMU, operator voice commands). The key insight is that **the manifest + Dask ETL pattern is modality-agnostic** — only the leaf-level readers change.
+
+### 5.1 Storage Format by Modality
+
+| Modality | At-Rest Format | Rationale |
+| :--- | :--- | :--- |
+| **Tabular telemetry** (IMU, GPS, fare) | Hive-partitioned Parquet | Predicate pushdown, columnar reads |
+| **Images / video frames** | WebDataset `.tar` shards | Sequential reads, no random-access overhead |
+| **LiDAR point clouds** | Parquet + binary blob columns | Co-located metadata for filtering |
+| **Operator voice** | `.tar` shards (wav + transcript JSON) | Same WebDataset pipeline as images |
+
+### 5.2 Unified Manifest Pattern
+
+Each modality writes its own `_manifest.json` to its storage prefix. A **cross-modal manifest** then joins them by timestamp bucket:
+
+```
+s3://data-lake/
+  tabular/   _manifest.json   ← pickup_month=01/part-0.parquet ...
+  images/    _manifest.json   ← cam_front/2025-01-01T00/*.tar   ...
+  lidar/     _manifest.json   ← lidar/2025-01-01T00/*.parquet   ...
+  multimodal/_manifest.json   ← joined by 1-second timestamp buckets
+```
+
+The `ParquetStreamingDataset` in `train_pytorch_ddp.py` reads the multimodal manifest and yields `(tabular_features, image_tensor, lidar_array, label)` tuples without loading the full dataset into RAM — same O(1) memory guarantee.
+
+### 5.3 Ingestion Pipeline
+
+```
+Robot sensor stream
+  → Kafka topic (per modality)
+  → Flink consumer
+      → tabular rows  → Parquet writer (existing Dask ETL path)
+      → image frames  → WebDataset tar writer (sequential shards)
+      → LiDAR scans   → Parquet + binary blob writer
+  → _manifest.json updated atomically after each partition flush
+  → DDP training job reads new partitions on next epoch
+```
+
+The existing `fsspec` + `pyarrow` stack already supports S3/GCS for all these writers — no new storage abstraction required.
+
+### 5.4 Training-Serving Skew for Multimodal
+
+The `TemporalFeatureEngineer` pattern generalises: each modality gets its own stateless `Transformer` (e.g., `ImageNormalizer`, `LiDARVoxelizer`) embedded in the training pipeline and the serving runtime. Derived features (normalised pixel values, voxel grids) are never stored — always recomputed on-the-fly from raw bytes, eliminating cross-modality skew.
+
+---
+
 ## Opportunities for Improvement
 
 While the current architecture is robust and scalable, several enhancements can further future-proof the pipeline for true petabyte-scale and production reliability:
 
-- **Table Catalog/Schema Evolution:**  
+- **Table Catalog/Schema Evolution:**
     Integrate a table catalog (e.g., Apache Iceberg, Delta Lake, or Hive Metastore) to support schema evolution and further accelerate metadata operations beyond manifest files.
 
-- **Advanced Data Loaders:**  
+- **Advanced Data Loaders:**
     For distributed training at scale, consider integrating Petastorm or WebDataset for efficient, sharded data streaming using the manifest file as input.
 
-- **Observability:**  
-    Add centralized logging and metrics (e.g., Prometheus, Grafana, ELK) for end-to-end monitoring and alerting.
+- **Observability:**
+    Prometheus + Grafana are now provisioned via `docker-compose.yml`. Next step: add GPU utilisation metrics (DCGM exporter) and Loki for structured log aggregation.
 
-- **Circuit Breakers and Retries:**  
+- **Circuit Breakers and Retries:**
     Ensure API clients implement robust retry and circuit breaker logic to gracefully handle service overloads.
 
-- **Automated Data Quality Monitoring:**  
-    Automate the generation and validation of summary statistics to catch data drift and anomalies early.
+- **Automated Data Quality Monitoring:**
+    Automate the generation and validation of summary statistics to catch data drift and anomalies early. Evidently drift reports are now available at `GET /monitoring/drift`.

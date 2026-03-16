@@ -2,6 +2,7 @@
 
 import logging
 import os
+import tempfile
 
 from src.config import config
 
@@ -15,8 +16,10 @@ from sklearn.pipeline import Pipeline
 # Try importing ONNX tools (fault tolerance if packages are missing)
 try:
     from skl2onnx import to_onnx
+    from onnxruntime.quantization import quantize_dynamic, QuantType
 except ImportError:
     to_onnx = None
+    quantize_dynamic = None
     print("⚠️ ONNX tools missing. ONNX export will be skipped.")
 
 from src.features.core import (
@@ -134,14 +137,23 @@ def train(
                 # Convert to ONNX
                 onx = to_onnx(xgb_s, X_tensor)
 
-                # Save and log
-                onnx_path = "model.onnx"
-                with open(onnx_path, "wb") as f:
-                    f.write(onx.SerializeToString())
+                # Save and log — use a temp dir so concurrent runs don't collide
+                with tempfile.TemporaryDirectory() as tmp:
+                    onnx_path = os.path.join(tmp, "model.onnx")
+                    with open(onnx_path, "wb") as f:
+                        f.write(onx.SerializeToString())
 
-                mlflow.log_artifact(onnx_path, artifact_path="onnx")
-                logger.info(f"✅ ONNX saved to {onnx_path} & logged")
-                os.remove(onnx_path)  # Cleanup local file
+                    mlflow.log_artifact(onnx_path, artifact_path="onnx")
+                    logger.info("✅ ONNX saved & logged")
+
+                    # INT8 quantization — ~4x smaller, 2-3x faster on edge hardware.
+                    # Uses dynamic quantization (no calibration dataset required).
+                    if quantize_dynamic is not None:
+                        int8_path = os.path.join(tmp, "model_int8.onnx")
+                        quantize_dynamic(onnx_path, int8_path, weight_type=QuantType.QUInt8)
+                        mlflow.log_artifact(int8_path, artifact_path="onnx")
+                        logger.info("✅ INT8 ONNX saved & logged")
+                    # TemporaryDirectory context manager cleans up both files automatically
             except Exception as e:
                 logger.error(f"❌ Failed to export ONNX model: {e}")
 

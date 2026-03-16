@@ -1,0 +1,97 @@
+{
+  "title": "NYC Taxi API",
+  "uid": "nyc-taxi-api",
+  "schemaVersion": 38,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[1m])) by (handler)",
+          "legendFormat": "{{handler}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" } }
+      }
+    },
+    {
+      "id": 2,
+      "title": "P95 Latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le, handler)) * 1000",
+          "legendFormat": "p95 {{handler}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[1m])) by (le, handler)) * 1000",
+          "legendFormat": "p50 {{handler}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "color": { "mode": "palette-classic" } }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Error Rate (4xx + 5xx / s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status_code=~\"4..|5..\"}[1m])) by (status_code)",
+          "legendFormat": "HTTP {{status_code}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "fixedColor": "red", "mode": "fixed" } }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Total Predictions",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(http_requests_total{handler=\"/predict\", status_code=\"200\"})",
+          "legendFormat": "Predictions"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "green", "value": null }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Model Loaded",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{handler=\"/health\", status_code=\"200\"}[1m]))",
+          "legendFormat": "Health checks/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 0.01 }
+          ]}
+        }
+      }
+    }
+  ]
+}
