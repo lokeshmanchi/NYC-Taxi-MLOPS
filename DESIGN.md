@@ -28,18 +28,19 @@ While the current implementation runs locally for demonstration purposes, the un
 
 ```mermaid
 graph LR
+    P[Prefect Orchestration<br/>(etl_and_train_flow)] -.->|Runs ETL| B
+    P -.->|Launches torchrun| D
     A[Raw Data Lake<br/>(S3 / GCS)] -->|Lazy Loading| B[Distributed ETL<br/>(Dask)]
-    B -.->|Prefect Flow| B
-    B -->|Sharded Parquet| C[Feature Store /<br/>Processed Data Lake]
-    C -->|Streaming| D[Distributed Training<br/>(PyTorch DDP)]
-    D -->|Model Artifacts| E[Model Registry<br/>(MLflow)]
-    D -.->|Local .pt File| G[Local Checkpoint]
-    E -->|REST API| F[Model Serving<br/>(Kubernetes / TorchServe)]
-    
+    B -->|Hive-partitioned Parquet<br/>+ _manifest.json| C[Feature Store /<br/>Processed Data Lake]
+    C -->|Streaming via Manifest| D[Distributed Training<br/>(PyTorch DDP)]
+    D -->|Model Artifacts| E[MLflow<br/>(Model Registry +<br/>Experiment Tracking)]
+    D -.->|Epoch Checkpoint<br/>(fsspec — local / S3)| G[Checkpoint Store]
+    E -->|Model Artifact| F[Model Serving<br/>(FastAPI — Hybrid ONNX/sklearn)]
+
     subgraph "Observability"
-        M[Metrics & Logs]
+        M[Metrics & Logs<br/>(Prometheus / Grafana)]
     end
-    
+
     B -.-> M
     D -.-> M
     F -.-> M
