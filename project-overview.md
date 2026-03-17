@@ -1,4 +1,4 @@
-# NYC Taxi MLOps — Interview Reference Report
+# NYC Taxi MLOps
 
 A complete technical walkthrough of every component, including the reasoning behind each design decision.
 
