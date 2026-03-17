@@ -28,17 +28,17 @@ While the current implementation runs locally for demonstration purposes, the un
 
 ```mermaid
 graph LR
-    P[Prefect Orchestration<br/>(etl_and_train_flow)] -.->|Runs ETL| B
+    P["Prefect Orchestration\netl_and_train_flow"] -.->|Runs ETL| B
     P -.->|Launches torchrun| D
-    A[Raw Data Lake<br/>(S3 / GCS)] -->|Lazy Loading| B[Distributed ETL<br/>(Dask)]
-    B -->|Hive-partitioned Parquet<br/>+ _manifest.json| C[Feature Store /<br/>Processed Data Lake]
-    C -->|Streaming via Manifest| D[Distributed Training<br/>(PyTorch DDP)]
-    D -->|Model Artifacts| E[MLflow<br/>(Model Registry +<br/>Experiment Tracking)]
-    D -.->|Epoch Checkpoint<br/>(fsspec — local / S3)| G[Checkpoint Store]
-    E -->|Model Artifact| F[Model Serving<br/>(FastAPI — Hybrid ONNX/sklearn)]
+    A["Raw Data Lake\nS3 / GCS"] -->|Lazy Loading| B["Distributed ETL\nDask"]
+    B -->|"Hive-partitioned Parquet\n+ _manifest.json"| C["Feature Store\nProcessed Data Lake"]
+    C -->|Streaming via Manifest| D["Distributed Training\nPyTorch DDP"]
+    D -->|Model Artifacts| E["MLflow\nModel Registry + Experiment Tracking"]
+    D -.->|"Epoch Checkpoint\nfsspec local or S3"| G["Checkpoint Store"]
+    E -->|Model Artifact| F["Model Serving\nFastAPI Hybrid ONNX/sklearn"]
 
-    subgraph "Observability"
-        M[Metrics & Logs<br/>(Prometheus / Grafana)]
+    subgraph Observability
+        M["Metrics and Logs\nPrometheus / Grafana"]
     end
 
     B -.-> M
