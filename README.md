@@ -7,13 +7,14 @@ flowchart TD
     A["Raw Data (Parquet)"] -->|Dask Lazy Load| B["ETL (transform.py)\nfilter + engineer features"]
     B -->|Hive-partitioned Parquet\n+ _manifest.json + hourly_summary| C["Processed Data"]
     C -->|Stream w/ Manifest| E2["Distributed Training\n(PyTorch DDP)"]
-    E2 -->|Log nyc-taxi-regressor-ddp| F["MLflow Model Registry"]
+    E2 -->|Log nyc-taxi-regressor-ddp| F["MLflow\n(Model Registry + Experiment Tracking)"]
     A -->|Load & Transform| D["Train/Test Split"]
     D -->|Pandas DataFrame| E["XGBoost Training\n(train.py)"]
     E -->|Log nyc-taxi-regressor\n+ ONNX artifact| F
     F -->|Model Artifact| G["Model Serving API\n(FastAPI — Hybrid ONNX/sklearn)"]
     G -->|Prediction + log row| P["Prediction Logs\n(data/predictions/)"]
     P -->|Evidently comparison| MON["GET /monitoring/drift\n(HTML drift report)"]
+    C -->|Reference data| MON
     G -->|Fare prediction| H["User / API Client"]
     C -->|hourly_summary.parquet| I["EDA Dashboard\n(1_EDA.py)"]
     F -->|Load pipeline| J["Model Performance\n(2_Model_Performance.py)"]
@@ -25,12 +26,9 @@ flowchart TD
     K1 -->|Wraps with retry| E
     K2 -->|Runs ETL| B
     K2 -->|Launches torchrun| E2
-    subgraph Experiment_Tracking
-      L["MLflow"]
-    end
-    E -.-> L
-    E2 -.-> L
-    J -.->|Fetch run data| L
+    E -.->|Log metrics| F
+    E2 -.->|Log metrics| F
+    J -.->|Fetch run data| F
 ```
 
 ### Diagram Explanation
